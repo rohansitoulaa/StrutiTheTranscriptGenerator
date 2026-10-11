@@ -97,6 +97,40 @@ impl Settings {
     }
 }
 
+/// Where Obsidian (native or Flatpak) keeps its list of vaults.
+fn obsidian_configs(home: &Path) -> [PathBuf; 2] {
+    [
+        home.join(".config/obsidian/obsidian.json"),
+        home.join(".var/app/md.obsidian.Obsidian/config/obsidian/obsidian.json"),
+    ]
+}
+
+/// `Shruti/` inside the vault Obsidian has open, else the one opened most
+/// recently (PDA UI-7). `None` when Obsidian lists no vault.
+pub fn default_out_dir(home: &Path) -> Option<PathBuf> {
+    #[derive(Deserialize)]
+    struct Config {
+        #[serde(default)]
+        vaults: std::collections::HashMap<String, Vault>,
+    }
+    #[derive(Deserialize)]
+    struct Vault {
+        path: PathBuf,
+        #[serde(default)]
+        ts: u64,
+        #[serde(default)]
+        open: bool,
+    }
+    obsidian_configs(home)
+        .iter()
+        .filter_map(|file| std::fs::read_to_string(file).ok())
+        .filter_map(|text| serde_json::from_str::<Config>(&text).ok())
+        .flat_map(|c| c.vaults.into_values())
+        .filter(|v| v.path.is_dir())
+        .max_by_key(|v| (v.open, v.ts))
+        .map(|v| v.path.join("Shruti"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +160,25 @@ mod tests {
         std::fs::write(&path, "{ not json").unwrap();
         let err = Settings::load(&path).unwrap_err().to_string();
         assert!(err.contains("settings file"), "{err}");
+    }
+
+    #[test]
+    fn the_default_folder_is_in_the_open_obsidian_vault() {
+        let home = tempfile::tempdir().unwrap();
+        let (a, b) = (home.path().join("Old Vault"), home.path().join("Notes"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        assert_eq!(default_out_dir(home.path()), None);
+
+        let flatpak = &obsidian_configs(home.path())[1];
+        std::fs::create_dir_all(flatpak.parent().unwrap()).unwrap();
+        let config = serde_json::json!({"vaults": {
+            "1": {"path": a, "ts": 900},
+            "2": {"path": b, "ts": 100, "open": true},
+            "3": {"path": home.path().join("deleted"), "ts": 999, "open": true},
+        }});
+        std::fs::write(flatpak, config.to_string()).unwrap();
+        assert_eq!(default_out_dir(home.path()), Some(b.join("Shruti")));
     }
 
     #[test]

@@ -3,7 +3,7 @@ import { cn } from "../lib/utils";
 
 const colors: Record<Tone, string> = {
   idle: "bg-idle",
-  run: "bg-accent animate-pulse",
+  run: "bg-accent motion-safe:animate-pulse",
   ok: "bg-ok",
   warn: "bg-warn",
   bad: "bg-bad",

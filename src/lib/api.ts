@@ -25,6 +25,7 @@ export interface Job {
   review: boolean;
   note_path: string | null;
   folder: string | null;
+  folder_new: boolean;
   title: string | null;
   channel: string | null;
 }

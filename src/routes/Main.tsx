@@ -27,7 +27,7 @@ export function Main() {
     <div className="flex h-full flex-col">
       <header className="flex shrink-0 items-start gap-2 border-b border-line bg-panel p-2">
         <LinkInput />
-        <Button icon aria-label={paused ? "Resume" : "Pause"} aria-pressed={paused} onClick={() => void togglePause()}>
+        <Button icon aria-label={paused ? "Resume" : "Pause"} onClick={() => void togglePause()}>
           {paused ? <Play size={13} /> : <Pause size={13} />}
         </Button>
       </header>

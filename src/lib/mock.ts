@@ -49,6 +49,7 @@ const jobs: Job[] = Array.from({ length: 64 }, (_, i) => {
     review: i % 11 === 1,
     note_path: status === "done" ? `/vault/Shruti/Design/UX/${titles[i % titles.length]}.md` : null,
     folder: status === "done" ? (i % 3 === 0 ? "Design/UX" : i % 3 === 1 ? "Film/Analysis" : "Inbox") : null,
+    folder_new: i === 1,
     title: stage === "metadata" ? null : titles[i % titles.length],
     channel: stage === "metadata" ? null : instagram ? "synsation_" : i % 2 ? "Kole Jain" : "Some Channel",
   };

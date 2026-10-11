@@ -424,6 +424,50 @@ pub async fn known_keys(
     Ok(known.into_iter().collect())
 }
 
+/// Jobs still queued or running; waiting ones count as idle.
+pub async fn open_count(pool: &PgPool) -> Result<i64> {
+    Ok(
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE status IN ('queued', 'running')")
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+/// What finished since `since`, for the batch-finished notification (PDA
+/// Q-8, FO-11).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Summary {
+    pub done: i64,
+    pub review: i64,
+    pub failed: i64,
+    pub new_folders: Vec<String>,
+}
+
+pub async fn summary_since(pool: &PgPool, since: chrono::DateTime<chrono::Utc>) -> Result<Summary> {
+    let row = sqlx::query(
+        "SELECT count(*) FILTER (WHERE status = 'done') AS done,
+                count(*) FILTER (WHERE status = 'done' AND review) AS review,
+                count(*) FILTER (WHERE status = 'failed') AS failed
+         FROM jobs WHERE updated_at >= $1",
+    )
+    .bind(since)
+    .fetch_one(pool)
+    .await?;
+    let new_folders = sqlx::query_scalar(
+        "SELECT DISTINCT folder FROM jobs
+         WHERE folder_new AND status = 'done' AND updated_at >= $1 ORDER BY folder",
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    Ok(Summary {
+        done: row.try_get("done")?,
+        review: row.try_get("review")?,
+        failed: row.try_get("failed")?,
+        new_folders,
+    })
+}
+
 /// `is_new`: the file stage created this folder (FO-11).
 pub async fn set_folder(pool: &PgPool, id: i64, folder: &str, is_new: bool) -> Result<bool> {
     let done = sqlx::query(
@@ -1239,6 +1283,43 @@ mod tests {
                 content_sha256: "h2".into()
             }]
         );
+    }
+
+    #[sqlx::test]
+    async fn a_batch_summary_counts_what_finished_since_it_started(pool: PgPool) {
+        for key in ["youtube:a", "youtube:b", "youtube:c", "youtube:d"] {
+            add(&pool, key).await;
+        }
+        sqlx::query(
+            "UPDATE jobs SET updated_at = now() - interval '1 hour' WHERE video_key = 'youtube:d'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let since = chrono::Utc::now() - chrono::Duration::minutes(5);
+        assert_eq!(open_count(&pool).await.unwrap(), 4);
+        sqlx::query(
+            "UPDATE jobs SET status = CASE video_key
+                WHEN 'youtube:a' THEN 'done' WHEN 'youtube:b' THEN 'done' ELSE 'failed' END,
+              stage = CASE WHEN video_key = 'youtube:c' THEN 'fetch' ELSE 'done' END,
+              review = (video_key = 'youtube:b'),
+              folder = 'Design/UX', folder_new = (video_key = 'youtube:a')
+             WHERE video_key IN ('youtube:a', 'youtube:b', 'youtube:c')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let summary = summary_since(&pool, since).await.unwrap();
+        assert_eq!(
+            summary,
+            Summary {
+                done: 2,
+                review: 1,
+                failed: 1,
+                new_folders: vec!["Design/UX".into()]
+            }
+        );
+        assert_eq!(open_count(&pool).await.unwrap(), 1, "d is still queued");
     }
 
     #[sqlx::test]

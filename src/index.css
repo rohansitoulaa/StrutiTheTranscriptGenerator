@@ -10,8 +10,11 @@
   --accent: #2563eb;
   --ok: #16a34a;
   --warn: #c2770c;
+  /* Text needs 4.5:1; the dot colour above only needs 3:1. */
+  --warn-text: #94580a;
   --bad: #dc2626;
-  --idle: #9d9da6;
+  --idle: #83838c;
+  --on-accent: #ffffff;
   color-scheme: light;
 }
 
@@ -26,8 +29,10 @@
     --accent: #6ea0ff;
     --ok: #4ade80;
     --warn: #f0b04a;
+    --warn-text: #f0b04a;
     --bad: #f87171;
     --idle: #6e6e78;
+    --on-accent: #0b1220;
     color-scheme: dark;
   }
 }
@@ -44,6 +49,8 @@
   --color-accent: var(--accent);
   --color-ok: var(--ok);
   --color-warn: var(--warn);
+  --color-warn-text: var(--warn-text);
+  --color-on-accent: var(--on-accent);
   --color-bad: var(--bad);
   --color-idle: var(--idle);
 }

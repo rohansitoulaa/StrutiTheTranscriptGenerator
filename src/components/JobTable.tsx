@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { useNavigate } from "react-router";
 import {
   flexRender,
@@ -79,7 +79,7 @@ const columns: ColumnDef<Job>[] = [
         <StateDot tone={tone(j)} />
         <span className={cn("truncate", j.status === "failed" && "text-bad")}>
           {stateLabel(j)}
-          {j.status === "done" && j.review && <span className="text-warn"> · review</span>}
+          {j.status === "done" && j.review && <span className="text-warn-text"> · review</span>}
         </span>
         {j.status === "running" && (
           <span className="ml-auto h-1 w-8 shrink-0 overflow-hidden rounded bg-line">
@@ -108,7 +108,10 @@ const columns: ColumnDef<Job>[] = [
     accessorFn: (j) => `${platform(j)} ${j.channel ?? ""}`,
     cell: ({ row: { original: j } }) => (
       <span className="flex min-w-0 items-center gap-1.5">
-        <span className="shrink-0 text-[10px] font-medium tracking-wide text-muted uppercase">
+        <span
+          aria-label={platform(j) === "youtube" ? "YouTube" : "Instagram"}
+          className="shrink-0 text-[10px] font-medium tracking-wide text-muted uppercase"
+        >
           {platform(j) === "youtube" ? "YT" : "IG"}
         </span>
         <span className="truncate">{j.channel}</span>
@@ -119,7 +122,12 @@ const columns: ColumnDef<Job>[] = [
     id: "folder",
     header: "Folder",
     accessorFn: (j) => j.folder ?? "",
-    cell: ({ getValue }) => <span className="truncate text-muted">{getValue<string>()}</span>,
+    cell: ({ row: { original: j } }) => (
+      <span className="flex min-w-0 items-center gap-1.5">
+        <span className="truncate text-muted">{j.folder}</span>
+        {j.folder_new && <span className="shrink-0 rounded bg-accent/15 px-1 text-[10px] text-accent">new</span>}
+      </span>
+    ),
   },
   {
     id: "actions",
@@ -140,12 +148,15 @@ export function JobTable() {
   const filterBox = useRef<HTMLInputElement>(null);
   const scroller = useRef<HTMLDivElement>(null);
   const navigate = useNavigate();
+  // One row is the tab stop; arrows move it (a roving tabindex), so rows
+  // outside the rendered window are still reachable by keyboard.
+  const [active, setActive] = useState(0);
+  const focusPending = useRef(false);
 
   // `/` focuses the filter (UI-3).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null;
-      if (e.key === "/" && !target?.closest("input, textarea")) {
+      if (e.key === "/" && !(e.target instanceof Element && e.target.closest("input, textarea"))) {
         e.preventDefault();
         filterBox.current?.focus();
       }
@@ -183,14 +194,48 @@ export function JobTable() {
   });
 
   const visible = table.getRowModel().rows;
+  // Stable identities: new functions on every render make the virtualiser
+  // re-measure every row.
+  const estimateSize = useCallback(
+    (i: number) => (showsReason(visible[i].original) ? ROW_WITH_REASON : ROW),
+    [visible],
+  );
+  // Sizes follow the job, not its position, as filters reorder rows.
+  const getItemKey = useCallback((i: number) => visible[i].id, [visible]);
   const virtual = useVirtualizer({
     count: visible.length,
     getScrollElement: () => scroller.current,
-    estimateSize: (i) => (showsReason(visible[i].original) ? ROW_WITH_REASON : ROW),
-    // Sizes follow the job, not its position, as filters reorder rows.
-    getItemKey: (i) => visible[i].id,
+    estimateSize,
+    getItemKey,
     overscan: 12,
   });
+
+  const current = Math.min(active, Math.max(visible.length - 1, 0));
+  useEffect(() => {
+    if (!focusPending.current) return;
+    focusPending.current = false;
+    requestAnimationFrame(() =>
+      scroller.current?.querySelector<HTMLElement>(`[data-index="${current}"]`)?.focus(),
+    );
+  }, [current]);
+
+  function onGridKey(e: ReactKeyboardEvent<HTMLDivElement>) {
+    const page = Math.max(1, Math.floor((scroller.current?.clientHeight ?? 0) / ROW) - 1);
+    const moves: Record<string, number> = {
+      ArrowDown: current + 1,
+      ArrowUp: current - 1,
+      PageDown: current + page,
+      PageUp: current - page,
+      Home: 0,
+      End: visible.length - 1,
+    };
+    if (!(e.key in moves) || !(e.target instanceof HTMLElement) || !e.target.matches("[role=row]")) return;
+    e.preventDefault();
+    const next = Math.max(0, Math.min(visible.length - 1, moves[e.key]));
+    focusPending.current = true;
+    setActive(next);
+    virtual.scrollToIndex(next);
+  }
 
   const failed = jobs.filter((j) => j.status === "failed").length;
 
@@ -234,8 +279,8 @@ export function JobTable() {
           </Button>
         )}
       </div>
-      <div role="table" aria-rowcount={visible.length} className="flex min-h-0 flex-1 flex-col">
-        <div role="row" className={cn("grid shrink-0 gap-3 border-b border-line px-3 py-1 text-[11px] font-medium text-muted", GRID)}>
+      <div role="grid" aria-label="Queue" aria-rowcount={visible.length + 1} className="flex min-h-0 flex-1 flex-col">
+        <div role="row" aria-rowindex={1} className={cn("grid shrink-0 gap-3 border-b border-line px-3 py-1 text-[11px] font-medium text-muted", GRID)}>
           {table.getHeaderGroups()[0].headers.map((h) => (
             <div
               key={h.id}
@@ -252,7 +297,7 @@ export function JobTable() {
             </div>
           ))}
         </div>
-        <div ref={scroller} className="min-h-0 flex-1 overflow-auto">
+        <div ref={scroller} onKeyDown={onGridKey} className="min-h-0 flex-1 overflow-auto">
           <div style={{ height: virtual.getTotalSize(), position: "relative" }}>
             {virtual.getVirtualItems().map((v) => {
               const row = visible[v.index];
@@ -262,10 +307,13 @@ export function JobTable() {
                 <div
                   key={row.id}
                   role="row"
-                  tabIndex={0}
-                  aria-rowindex={v.index + 1}
+                  data-index={v.index}
+                  tabIndex={v.index === current ? 0 : -1}
+                  aria-rowindex={v.index + 2}
+                  onFocus={() => setActive(v.index)}
                   onClick={() => openable && navigate(`/job/${j.id}`)}
-                  onKeyDown={(e) => e.key === "Enter" && openable && navigate(`/job/${j.id}`)}
+                  // Enter on an action button inside the row is that button's.
+                  onKeyDown={(e) => e.key === "Enter" && e.target === e.currentTarget && openable && navigate(`/job/${j.id}`)}
                   className={cn(
                     "group absolute inset-x-0 grid items-center gap-3 border-b border-line/50 px-3 text-[12px] hover:bg-hover",
                     GRID,
@@ -273,7 +321,7 @@ export function JobTable() {
                   style={{ height: v.size, transform: `translateY(${v.start}px)` }}
                 >
                   {row.getVisibleCells().map((cell) => (
-                    <div key={cell.id} role="cell" className="min-w-0">
+                    <div key={cell.id} role="gridcell" className="min-w-0">
                       {flexRender(cell.column.columnDef.cell, cell.getContext())}
                     </div>
                   ))}

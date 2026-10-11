@@ -17,12 +17,13 @@ export default function App() {
     };
     load();
     if (!inTauri) return;
+    const fail = (e: unknown) => console.error("event listener", e);
     const unlisten = [
       listen<JobEvent>("job", (e) => useStore.getState().applyEvent(e.payload)),
       // Missed events, or the core finished starting: read everything again.
       listen("jobs-stale", () => void useStore.getState().refresh()),
       listen("core-status", load),
-    ];
+    ].map((p) => p.catch((e) => (fail(e), () => {})));
     return () => unlisten.forEach((p) => void p.then((f) => f()));
   }, []);
 

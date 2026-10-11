@@ -17,6 +17,8 @@ interface Store {
 }
 
 let refreshTimer: ReturnType<typeof setTimeout> | null = null;
+/** Only the newest read may land: an older one finishing late is stale. */
+let refreshSeq = 0;
 
 export const useStore = create<Store>((set, get) => ({
   jobs: [],
@@ -26,10 +28,12 @@ export const useStore = create<Store>((set, get) => ({
   loadError: null,
 
   refresh: async () => {
+    const seq = ++refreshSeq;
     try {
-      set({ jobs: await api.jobs(), loadError: null });
+      const jobs = await api.jobs();
+      if (seq === refreshSeq) set({ jobs, loadError: null });
     } catch (e) {
-      set({ loadError: errorText(e) });
+      if (seq === refreshSeq) set({ loadError: errorText(e) });
     }
   },
 

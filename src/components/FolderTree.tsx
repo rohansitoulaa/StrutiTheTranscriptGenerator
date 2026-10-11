@@ -15,7 +15,7 @@ export function FolderTree() {
       onClick={() => pick(path)}
       aria-pressed={selected === path}
       className={cn(
-        "flex h-[22px] w-full items-center gap-1.5 rounded px-1.5 text-left text-[12px] hover:bg-hover",
+        "flex h-[24px] w-full items-center gap-1.5 rounded px-1.5 text-left text-[12px] hover:bg-hover",
         selected === path && "bg-hover text-accent",
       )}
     >
@@ -29,8 +29,8 @@ export function FolderTree() {
     <nav aria-label="Folders" className="flex flex-col gap-1 overflow-auto p-1.5">
       <Item path="Inbox" label="Inbox" count={folders.inbox} icon />
       {folders.areas.map((area) => (
-        <div key={area.name}>
-          <div className="flex h-[22px] items-center gap-1.5 px-1.5 text-[11px] font-medium text-muted">
+        <div key={area.name} role="group" aria-labelledby={`area-${area.name}`}>
+          <div id={`area-${area.name}`} className="flex h-[22px] items-center gap-1.5 px-1.5 text-[11px] font-medium text-muted">
             <Folder size={12} className="shrink-0" />
             <span className="truncate">{area.name}</span>
           </div>

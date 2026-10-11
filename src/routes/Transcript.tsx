@@ -17,7 +17,14 @@ export function Transcript() {
   const jobs = useStore((s) => s.jobs);
   const job = jobs.find((j) => j.id === Number(id));
 
+  // A different job: never show the previous one's text meanwhile.
   useEffect(() => {
+    setView(null);
+    setError(null);
+  }, [id]);
+
+  useEffect(() => {
+    if (!id) return;
     let stale = false;
     api
       .transcript(Number(id))

@@ -26,8 +26,7 @@ export function LinkInput() {
   // Ctrl+V anywhere lands here.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null;
-      const editing = target?.closest("input, textarea, [contenteditable]");
+      const editing = e.target instanceof Element && e.target.closest("input, textarea, [contenteditable]");
       if (e.ctrlKey && e.key.toLowerCase() === "v" && !editing) box.current?.focus();
     };
     window.addEventListener("keydown", onKey);
@@ -103,7 +102,7 @@ export function LinkInput() {
         </Button>
       </div>
       {previews.length > 0 && (
-        <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[12px] text-muted">
+        <div aria-live="polite" className="flex flex-wrap gap-x-3 gap-y-0.5 text-[12px] text-muted">
           {previews.map((p) =>
             p.error ? (
               <span key={p.input} className="text-bad">{p.error}</span>
@@ -116,7 +115,7 @@ export function LinkInput() {
         </div>
       )}
       {problems.length > 0 && (
-        <ul className="max-h-24 overflow-auto text-[12px] text-bad select-text">
+        <ul aria-live="polite" className="max-h-24 overflow-auto text-[12px] text-bad select-text">
           {problems.map(([line, reason], i) => (
             <li key={i} className="truncate">
               {line && <span className="font-mono">{line}</span>} {reason}
