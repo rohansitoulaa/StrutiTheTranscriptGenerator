@@ -453,7 +453,14 @@ doesn't.
 2b. ✅ **LLM cleanup stage.** Prompt, chunking, length guardrail, re-clean,
    folder auto-sort. (Done 2026-10-12: `llm.rs`, `cleanup.rs`, `folders.rs`,
    `secrets.rs`, migration `0003_cleanup.sql`.)
-3. **Channel and profile expansion.** The part most likely to be fiddly.
+3. ✅ **Channel and profile expansion.** (Done 2026-10-12: `expand.rs`.)
+   YouTube channels (Videos + Shorts tabs) and playlists expand through
+   `yt-dlp --flat-playlist`; measured: `@kolejain` lists 52 videos in ~7 s.
+   Instagram pacing (1 at a time, 3 s apart, 60 s every 20 reels) and
+   auto-pause on 429s/login walls are in. **Instagram profiles are not:**
+   yt-dlp's extractor is broken upstream and Instagram has closed its REST
+   listing endpoints (see "Instagram, realistically"); profile links fail
+   with that reason until an update fixes yt-dlp or another way is chosen.
 4. **UI over the working core.** Queue table, live progress, transcript viewer.
 5. **Settings, notifications, the yt-dlp version check.**
 6. **Packaging.** `.rpm` for Fedora, AppImage as the portable fallback.
