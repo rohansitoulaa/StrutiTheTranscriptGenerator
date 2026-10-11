@@ -389,34 +389,44 @@ shruti/
 ├── vendor/                       # whisper.cpp + SPIRV-Headers sources (gitignored)
 ├── models/                       # Whisper + VAD models (gitignored)
 ├── src/                          # React frontend
-│   ├── components/
-│   │   ├── ui/                   # shadcn, owned by us
-│   │   ├── LinkInput.tsx
-│   │   ├── JobQueue.tsx
-│   │   └── TranscriptView.tsx
-│   ├── routes/
-│   │   ├── Main.tsx
-│   │   └── Settings.tsx
-│   ├── store/                    # Zustand
-│   └── lib/tauri.ts              # typed invoke + channel wrappers
-├── src-tauri/
-│   ├── src/
-│   │   ├── main.rs
-│   │   ├── commands.rs           # the frontend-facing API
-│   │   ├── queue/                # worker pool, semaphores
-│   │   ├── sources/              # URL parsing, channel/profile expansion
-│   │   ├── transcribe/           # Transcriber trait + impls
-│   │   ├── cleanup/              # Cleaner trait, OpenAI-compatible client, providers, chunking, guardrail
-│   │   ├── output/               # markdown + frontmatter writer
-│   │   ├── folders/              # auto-sorter, Shruti/ tree, .shruti descriptions, watcher, near-duplicate check
-│   │   └── db.rs                 # sqlx + Postgres
-│   ├── migrations/               # sqlx migrations
-│   ├── binaries/                 # yt-dlp, ffmpeg, whisper-cli sidecars
+│   ├── components/               # LinkInput, JobTable, FolderTree, StateDot, ui/button
+│   ├── routes/                   # Main, Transcript, Settings
+│   ├── lib/                      # api.ts (typed invoke), jobs.ts, mock.ts (dev-only sample data)
+│   └── store.ts                  # Zustand: jobs, status, folders
+├── src-tauri/                    # the app crate (shruti-app)
+│   ├── src/main.rs               # plugins, commands, logging, graceful exit
+│   ├── src/core.rs               # starts/restarts the core from settings
+│   ├── src/commands.rs           # the frontend-facing API
+│   ├── binaries/                 # sidecars staged by scripts/bundle-tools.sh (gitignored)
 │   └── tauri.conf.json
+├── scripts/bundle-tools.sh       # copies whisper-cli, fetches + verifies yt-dlp
 └── package.json
 ```
 
 ---
+
+## Packaging (step 6)
+
+- `sh scripts/bundle-tools.sh` once, then `npm run tauri build`: produces
+  `target/release/bundle/rpm/Shruti-0.1.0-1.x86_64.rpm` (62 MiB) and
+  `target/release/bundle/appimage/Shruti_0.1.0_amd64.AppImage` (162 MiB).
+- **Bundled:** `shruti-whisper-cli` (the local Vulkan build; whisper and
+  ggml are static, it needs only libvulkan and libgomp) and `shruti-yt-dlp`
+  (the official standalone `yt-dlp_linux`, checksum-verified). The prefix
+  keeps them clear of Fedora's own `/usr/bin/yt-dlp`.
+- **From the system:** ffmpeg and node (rpm `Requires: /usr/bin/ffmpeg,
+  /usr/bin/node`, so ffmpeg-free or RPM Fusion's ffmpeg both work),
+  vulkan-loader, libgomp, WebKitGTK 4.1, and Postgres itself.
+- **First launch of the installed app:** creates `Shruti/Inbox` in the vault
+  Obsidian has open (read from Obsidian's own vault list, native or
+  Flatpak), downloads the Whisper and VAD models (~600 MB) into
+  `~/.local/share/shruti/models`, and logs to
+  `~/.local/share/shruti/shruti.log`. Settings live in
+  `~/.config/shruti/settings.json`; API keys only in the keyring.
+- **Update yt-dlp** installs the latest release into
+  `~/.local/share/shruti/bin/yt-dlp`, which is used from then on.
+- Debug builds (`npm run tauri dev`) use the repo's tools and models and
+  write notes to `out/`.
 
 ## Why Tauri
 
@@ -461,6 +471,9 @@ doesn't.
    yt-dlp's extractor is broken upstream and Instagram has closed its REST
    listing endpoints (see "Instagram, realistically"); profile links fail
    with that reason until an update fixes yt-dlp or another way is chosen.
-4. **UI over the working core.** Queue table, live progress, transcript viewer.
-5. **Settings, notifications, the yt-dlp version check.**
-6. **Packaging.** `.rpm` for Fedora, AppImage as the portable fallback.
+4. ✅ **UI over the working core.** Queue table, live progress, transcript
+   viewer. (Done 2026-10-12: `src/`, `src-tauri/`.)
+5. ✅ **Settings, notifications, the yt-dlp version check.** (Done
+   2026-10-12: `settings.rs`, `tools.rs`, `src/routes/Settings.tsx`.)
+6. ✅ **Packaging.** `.rpm` for Fedora, AppImage as the portable fallback.
+   (Done 2026-10-12; see "Packaging" below.)
