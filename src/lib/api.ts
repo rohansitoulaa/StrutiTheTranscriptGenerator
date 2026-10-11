@@ -101,6 +101,68 @@ export interface TranscriptView {
   note_path: string | null;
 }
 
+export interface Check {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+/** Saved settings; unset fields use the defaults (core/src/settings.rs). */
+export interface Settings {
+  out_dir?: string | null;
+  database_url?: string | null;
+  llm_provider?: string | null;
+  llm_model?: string | null;
+  llm_base_url?: string | null;
+  llm_concurrency?: number | null;
+  chunk_tokens?: number | null;
+  cleanup_prompt?: string | null;
+  min_ratio?: number | null;
+  max_ratio?: number | null;
+  max_ratio_translated?: number | null;
+  whisper_model?: string | null;
+  gpu?: string | null;
+  cookies_browser?: string | null;
+  ig_delay_secs?: number | null;
+  ig_batch?: number | null;
+  ig_pause_secs?: number | null;
+}
+
+export interface Defaults {
+  out_dir: string;
+  database_url: string;
+  llm_provider: string;
+  llm_model: string;
+  llm_base_url: string;
+  llm_concurrency: number;
+  chunk_tokens: number;
+  cleanup_prompt: string;
+  min_ratio: number;
+  max_ratio: number;
+  max_ratio_translated: number;
+  whisper_model: string;
+  gpu: string;
+  ig_delay_secs: number;
+  ig_batch: number;
+  ig_pause_secs: number;
+}
+
+export interface SettingsView {
+  settings: Settings;
+  defaults: Defaults;
+  keys: [string, boolean][];
+  log_file: string;
+}
+
+export interface YtDlpInfo {
+  path: string;
+  version: string | null;
+  age_days: number | null;
+  managed: boolean;
+  latest: string | null;
+  error: string | null;
+}
+
 export interface RecleanResult {
   key: string;
   job_id: number | null;
@@ -121,6 +183,17 @@ export const api = {
   transcript: (id: number) => invoke<TranscriptView>("transcript", { id }),
   reveal: (id: number) => invoke<void>("reveal", { id }),
   openNote: (id: number) => invoke<void>("open_note", { id }),
+  health: () => invoke<Check[]>("health"),
+  getSettings: () => invoke<SettingsView>("get_settings"),
+  saveSettings: (settings: Settings) => invoke<void>("save_settings", { settings }),
+  setApiKey: (provider: string, key: string) => invoke<void>("set_api_key", { provider, key }),
+  removeApiKey: (provider: string) => invoke<void>("remove_api_key", { provider }),
+  listModels: (provider: string, baseUrl: string | null) => invoke<string[]>("list_models", { provider, baseUrl }),
+  testLlm: (provider: string, model: string, baseUrl: string | null) =>
+    invoke<number>("test_llm", { provider, model, baseUrl }),
+  ytdlpInfo: () => invoke<YtDlpInfo>("ytdlp_info"),
+  updateYtdlp: () => invoke<string>("update_ytdlp"),
+  openLog: () => invoke<void>("open_log"),
 };
 
 /** Errors from commands arrive as plain strings; show them raw (PDA UI-8). */

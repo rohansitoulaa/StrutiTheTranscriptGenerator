@@ -78,7 +78,49 @@ const transcript: TranscriptView = {
   note_path: "/vault/Shruti/Film/Analysis/Drishyam.md",
 };
 
+const defaults = {
+  out_dir: "/home/me/Documents/Obsidian Vault/Shruti",
+  database_url: "postgres://me@%2Fvar%2Frun%2Fpostgresql/shruti",
+  llm_provider: "lmstudio",
+  llm_model: "google/gemma-4-31b",
+  llm_base_url: "http://localhost:1234/v1",
+  llm_concurrency: 1,
+  chunk_tokens: 1200,
+  cleanup_prompt: "You clean up raw video transcripts…",
+  min_ratio: 0.25,
+  max_ratio: 1.1,
+  max_ratio_translated: 1.6,
+  whisper_model: "/repo/models/ggml-large-v3-turbo-q5_0.bin",
+  gpu: "auto",
+  ig_delay_secs: 3,
+  ig_batch: 20,
+  ig_pause_secs: 60,
+};
+
 const replies: Record<string, (args: Record<string, unknown>) => unknown> = {
+  get_settings: () => ({
+    settings: { cookies_browser: "brave" },
+    defaults,
+    keys: [["openai", false], ["gemini", true], ["custom", false]],
+    log_file: "/home/me/.local/share/shruti/shruti.log",
+  }),
+  health: () => [
+    { name: "Postgres", ok: true, detail: "connected" },
+    { name: "LLM", ok: false, detail: "LLM not reachable at http://localhost:1234/v1/models: connection refused" },
+    { name: "GPU", ok: true, detail: "Vulkan device 1" },
+    { name: "Whisper", ok: true, detail: defaults.whisper_model },
+    { name: "Queue", ok: true, detail: "running" },
+  ],
+  ytdlp_info: () => ({
+    path: "/usr/bin/yt-dlp",
+    version: "2026.08.19",
+    age_days: 54,
+    managed: false,
+    latest: "2026.10.01",
+    error: null,
+  }),
+  list_models: () => ["google/gemma-4-31b", "qwen/qwen3-8b"],
+  test_llm: () => 1234,
   status: () => ({ ready: true, error: null, out_dir: "/vault/Shruti", llm: "lmstudio/google/gemma-4-31b", paused: false }),
   jobs: () => jobs,
   folders: () => folders,

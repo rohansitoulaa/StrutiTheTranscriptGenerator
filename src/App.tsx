@@ -1,11 +1,28 @@
 import { useEffect } from "react";
-import { HashRouter, Route, Routes } from "react-router";
+import { HashRouter, Route, Routes, useNavigate } from "react-router";
 import { listen } from "@tauri-apps/api/event";
 import { Toaster } from "sonner";
 import { inTauri, type JobEvent } from "./lib/api";
 import { useStore } from "./store";
 import { Main } from "./routes/Main";
 import { Transcript } from "./routes/Transcript";
+import { Settings } from "./routes/Settings";
+
+/** Ctrl+, opens Settings from anywhere (PDA UI-5). */
+function Shortcuts() {
+  const navigate = useNavigate();
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.key === ",") {
+        e.preventDefault();
+        navigate("/settings");
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [navigate]);
+  return null;
+}
 
 export default function App() {
   useEffect(() => {
@@ -29,9 +46,11 @@ export default function App() {
 
   return (
     <HashRouter>
+      <Shortcuts />
       <Routes>
         <Route path="/" element={<Main />} />
         <Route path="/job/:id" element={<Transcript />} />
+        <Route path="/settings" element={<Settings />} />
       </Routes>
       <Toaster position="bottom-right" theme="system" toastOptions={{ className: "text-[12px]" }} />
     </HashRouter>

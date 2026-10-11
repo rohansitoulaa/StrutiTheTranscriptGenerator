@@ -1,4 +1,6 @@
-import { Pause, Play } from "lucide-react";
+import { useMemo } from "react";
+import { useNavigate } from "react-router";
+import { Pause, Play, Settings as Gear, TriangleAlert } from "lucide-react";
 import { toast } from "sonner";
 import { api, errorText } from "../lib/api";
 import { useStore } from "../store";
@@ -11,7 +13,20 @@ export function Main() {
   const status = useStore((s) => s.status);
   const loadError = useStore((s) => s.loadError);
   const refreshStatus = useStore((s) => s.refreshStatus);
+  const jobs = useStore((s) => s.jobs);
+  const navigate = useNavigate();
   const paused = status?.paused ?? false;
+
+  // The same extractor error across several videos usually means yt-dlp is
+  // out of date (PDA YT-4).
+  const extractorBreak = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const j of jobs) {
+      const extractor = j.status === "failed" && j.reason?.match(/ERROR: \[([^\]]+)\]/)?.[1];
+      if (extractor) counts.set(extractor, (counts.get(extractor) ?? 0) + 1);
+    }
+    return [...counts.values()].some((n) => n >= 3);
+  }, [jobs]);
 
   async function togglePause() {
     try {
@@ -27,8 +42,16 @@ export function Main() {
     <div className="flex h-full flex-col">
       <header className="flex shrink-0 items-start gap-2 border-b border-line bg-panel p-2">
         <LinkInput />
+        {extractorBreak && (
+          <Button variant="outline" className="border-warn text-warn-text" onClick={() => navigate("/settings")}>
+            <TriangleAlert size={12} /> Update yt-dlp
+          </Button>
+        )}
         <Button icon aria-label={paused ? "Resume" : "Pause"} onClick={() => void togglePause()}>
           {paused ? <Play size={13} /> : <Pause size={13} />}
+        </Button>
+        <Button icon aria-label="Settings" onClick={() => navigate("/settings")}>
+          <Gear size={13} />
         </Button>
       </header>
       {problem && (
