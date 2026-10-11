@@ -1,0 +1,3 @@
+ggml_vulkan: Found 2 Vulkan devices:
+ggml_vulkan: 0 = Intel(R) Arc(tm) Graphics (MTL) (Intel open-source Mesa driver) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 49152 | int dot: 1 | matrix cores: none
+ggml_vulkan: 1 = NVIDIA GeForce RTX 4060 Laptop GPU (NVK AD107) (NVK) | uma: 0 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 49152 | int dot: 1 | matrix cores: KHR_coopmat

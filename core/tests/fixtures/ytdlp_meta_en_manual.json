@@ -1,0 +1,41 @@
+{
+ "id": "jNQXAC9IVRw",
+ "title": "Me at the zoo",
+ "channel": "jawed",
+ "uploader": "jawed",
+ "uploader_id": "@jawed",
+ "duration": 19,
+ "upload_date": "20050424",
+ "language": null,
+ "webpage_url": "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+ "extractor_key": "Youtube",
+ "description": "Microplastics are accumulating in human brains at an alarming rate\nhttps://www.youtube.com/watch?v=0PT5c1z3LL8\n\n“Nanopla",
+ "subtitles": {
+  "en": [
+   {
+    "ext": "vtt",
+    "url": "https://example.invalid/en"
+   }
+  ],
+  "de": [
+   {
+    "ext": "vtt",
+    "url": "https://example.invalid/de"
+   }
+  ]
+ },
+ "automatic_captions": {
+  "en": [
+   {
+    "ext": "json3",
+    "url": "https://example.invalid/en"
+   }
+  ],
+  "de": [
+   {
+    "ext": "json3",
+    "url": "https://example.invalid/de"
+   }
+  ]
+ }
+}

@@ -1,0 +1,39 @@
+{
+ "id": "HE4rLEQpiXY",
+ "title": "How to think like a GENIUS UI/UX designer",
+ "channel": "Kole Jain",
+ "uploader": "Kole Jain",
+ "uploader_id": "@kolejain",
+ "duration": 331,
+ "upload_date": "20250627",
+ "language": "en-US",
+ "webpage_url": "https://www.youtube.com/watch?v=HE4rLEQpiXY",
+ "extractor_key": "Youtube",
+ "subtitles": {},
+ "automatic_captions": {
+  "en-orig": [
+   {
+    "ext": "json3",
+    "url": "https://example.invalid/en-orig"
+   }
+  ],
+  "en": [
+   {
+    "ext": "json3",
+    "url": "https://example.invalid/en"
+   }
+  ],
+  "de": [
+   {
+    "ext": "json3",
+    "url": "https://example.invalid/de"
+   }
+  ],
+  "hi": [
+   {
+    "ext": "json3",
+    "url": "https://example.invalid/hi"
+   }
+  ]
+ }
+}
