@@ -1,3 +1,7 @@
 [env]
 # #[sqlx::test] creates a throwaway database per test on this server.
 DATABASE_URL = "postgres://rohansitoula@%2Fvar%2Frun%2Fpostgresql/shruti_test"
+# Each #[sqlx::test] opens its own throwaway database plus a pool (and queue
+# tests a lock connection). At one test per core on a 22-core machine that
+# can hit Postgres' 100-connection limit during setup, so cap the threads.
+RUST_TEST_THREADS = "6"
