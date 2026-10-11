@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::captions::parse_json3;
 use crate::error::{fs_err, stderr_tail};
+use crate::expand::Listing;
 use crate::metadata::{CaptionKind, CaptionTrack, VideoMeta};
 use crate::process::{LONG, QUICK, run_tool};
 use crate::source::Source;
@@ -28,6 +29,10 @@ pub trait Fetcher {
     /// returns that path. The fixed name lets the queue find it again after
     /// a restart.
     fn audio(&self, url: &str, dir: &Path) -> impl Future<Output = Result<PathBuf>> + Send;
+
+    /// A channel tab, playlist or profile, flat: at most `limit` entries.
+    fn list(&self, url: &str, limit: Option<usize>)
+    -> impl Future<Output = Result<Listing>> + Send;
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +104,16 @@ impl YtDlp {
         args
     }
 
+    pub fn list_args(&self, url: &str, limit: Option<usize>) -> Vec<OsString> {
+        let mut args = self.base_args(url);
+        args.extend(["--flat-playlist".into(), "-J".into()]);
+        if let Some(n) = limit {
+            args.extend(["--playlist-end".into(), n.to_string().into()]);
+        }
+        args.push(url.into());
+        args
+    }
+
     pub fn audio_args(&self, url: &str, out_template: &Path) -> Vec<OsString> {
         let mut args = self.base_args(url);
         args.extend([
@@ -120,12 +135,25 @@ impl YtDlp {
 
 impl Fetcher for YtDlp {
     async fn metadata(&self, url: &str) -> Result<VideoMeta> {
-        let out = run_tool("yt-dlp", &self.bin, &self.metadata_args(url), QUICK).await?;
+        let out = run_tool("yt-dlp", &self.bin, &self.metadata_args(url), QUICK)
+            .await
+            .map_err(|e| classify(url, e))?;
         let json = std::str::from_utf8(&out.stdout).map_err(|e| Error::Parse {
             what: "yt-dlp metadata",
             reason: e.to_string(),
         })?;
         VideoMeta::from_ytdlp_json(json)
+    }
+
+    async fn list(&self, url: &str, limit: Option<usize>) -> Result<Listing> {
+        let out = run_tool("yt-dlp", &self.bin, &self.list_args(url, limit), LISTING)
+            .await
+            .map_err(|e| classify(url, e))?;
+        let json = std::str::from_utf8(&out.stdout).map_err(|e| Error::Parse {
+            what: "yt-dlp listing",
+            reason: e.to_string(),
+        })?;
+        Listing::from_ytdlp_json(json)
     }
 
     async fn captions(&self, url: &str, track: &CaptionTrack, dir: &Path) -> Result<Vec<Segment>> {
@@ -136,7 +164,8 @@ impl Fetcher for YtDlp {
             &self.captions_args(url, track, &template),
             QUICK,
         )
-        .await?;
+        .await
+        .map_err(|e| classify(url, e))?;
         // yt-dlp exits 0 when a requested track doesn't exist, so a missing
         // file is the failure signal. Its stderr usually says why.
         let path = caption_file(dir, &track.code).ok_or_else(|| {
@@ -153,7 +182,9 @@ impl Fetcher for YtDlp {
 
     async fn audio(&self, url: &str, dir: &Path) -> Result<PathBuf> {
         let template = dir.join(format!("{AUDIO_STEM}.%(ext)s"));
-        let out = run_tool("yt-dlp", &self.bin, &self.audio_args(url, &template), LONG).await?;
+        let out = run_tool("yt-dlp", &self.bin, &self.audio_args(url, &template), LONG)
+            .await
+            .map_err(|e| classify(url, e))?;
         let wav = dir.join(AUDIO_FILE);
         let size = match tokio::fs::metadata(&wav).await {
             Ok(m) => m.len(),
@@ -186,6 +217,34 @@ fn with_stderr(msg: String, stderr: &[u8]) -> String {
     } else {
         format!("{msg}: {tail}")
     }
+}
+
+/// A big channel's flat listing pages through hundreds of entries.
+const LISTING: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// What yt-dlp prints when Instagram throttles or walls off a session.
+const INSTAGRAM_BLOCK_SIGNS: [&str; 8] = [
+    "429",
+    "too many requests",
+    "rate-limit",
+    "rate limit",
+    "login required",
+    "please wait a few minutes",
+    "checkpoint_required",
+    "challenge_required",
+];
+
+/// Instagram throttling pauses Instagram jobs instead of failing them.
+fn classify(url: &str, e: Error) -> Error {
+    if let Error::ToolFailed { stderr, .. } = &e
+        && is_instagram(url)
+    {
+        let lower = stderr.to_ascii_lowercase();
+        if INSTAGRAM_BLOCK_SIGNS.iter().any(|s| lower.contains(s)) {
+            return Error::InstagramBlocked(stderr.clone());
+        }
+    }
+    e
 }
 
 fn is_instagram(url: &str) -> bool {
@@ -241,6 +300,53 @@ mod tests {
                 URL
             ]
         );
+    }
+
+    #[test]
+    fn listings_are_flat_and_capped() {
+        let args = strs(bare().list_args("https://www.youtube.com/@k/videos", Some(5)));
+        assert_eq!(
+            args,
+            [
+                "--no-warnings",
+                "--no-progress",
+                "--flat-playlist",
+                "-J",
+                "--playlist-end",
+                "5",
+                "https://www.youtube.com/@k/videos"
+            ]
+        );
+        assert!(!strs(bare().list_args("u", None)).contains(&"--playlist-end".to_string()));
+    }
+
+    #[test]
+    fn instagram_throttling_pauses_instead_of_failing() {
+        let failed = |stderr: &str| Error::ToolFailed {
+            tool: "yt-dlp",
+            status: "exit status: 1".into(),
+            stderr: stderr.into(),
+        };
+        const REEL: &str = "https://www.instagram.com/reel/DboSoFGP5Hw/";
+        for stderr in [
+            "ERROR: [Instagram] DboSoFGP5Hw: Requested content is not available, rate-limit reached or login required",
+            "HTTP Error 429: Too Many Requests",
+            "checkpoint_required",
+        ] {
+            assert!(
+                matches!(classify(REEL, failed(stderr)), Error::InstagramBlocked(_)),
+                "{stderr}"
+            );
+        }
+        assert!(matches!(
+            classify(REEL, failed("ERROR: Unsupported URL")),
+            Error::ToolFailed { .. }
+        ));
+        // YouTube's own 429s are ordinary failures (PDA IG-5 is Instagram only).
+        assert!(matches!(
+            classify("https://youtu.be/neE6wOuBIP8", failed("HTTP Error 429")),
+            Error::ToolFailed { .. }
+        ));
     }
 
     #[test]

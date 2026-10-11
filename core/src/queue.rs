@@ -11,11 +11,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use sqlx::PgPool;
-use tokio::sync::{Notify, Semaphore, broadcast};
+use tokio::sync::{Notify, Semaphore, SemaphorePermit, broadcast};
 use tokio::task::{AbortHandle, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -23,6 +23,7 @@ use uuid::Uuid;
 use crate::cleanup::{self, CleanupSettings};
 use crate::db::{self, Added, Job, Stage, Status};
 use crate::error::fs_err;
+use crate::expand::{self, Collection};
 use crate::folders::{self, FolderTree, Placement};
 use crate::llm::{ChatReply, Llm, LlmError};
 use crate::metadata::VideoMeta;
@@ -45,6 +46,7 @@ pub struct Limits {
     /// Concurrent LLM requests: 1 for a local model, a few for cloud
     /// providers (PDA LLM-7).
     pub llm: usize,
+    pub instagram: Pacing,
 }
 
 impl Default for Limits {
@@ -53,6 +55,30 @@ impl Default for Limits {
             downloads: 3,
             whisper: 1,
             llm: 1,
+            instagram: Pacing::default(),
+        }
+    }
+}
+
+/// Instagram requests go one at a time, spaced out, with a longer break
+/// every few reels (PDA IG-3, IG-4); a block pauses them all (IG-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pacing {
+    pub gap: Duration,
+    /// Reels between longer pauses; 0 never pauses.
+    pub batch: u32,
+    pub pause: Duration,
+    /// How long Instagram jobs wait after Instagram starts blocking.
+    pub block_wait: Duration,
+}
+
+impl Default for Pacing {
+    fn default() -> Self {
+        Pacing {
+            gap: Duration::from_secs(3),
+            batch: 20,
+            pause: Duration::from_secs(60),
+            block_wait: Duration::from_secs(30 * 60),
         }
     }
 }
@@ -78,8 +104,60 @@ pub struct EnqueueReport {
     /// `(input, reason)` for lines that aren't usable links.
     pub rejected: Vec<(String, String)>,
     /// `(input, reason)` for valid links that couldn't be queued (a
-    /// database error). Other lines still go in.
+    /// database error, a collection that couldn't be listed). Other lines
+    /// still go in.
     pub errors: Vec<(String, String)>,
+    /// One per pasted channel, playlist or profile (PDA IN-4).
+    pub collections: Vec<CollectionReport>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CollectionReport {
+    pub input: String,
+    pub title: String,
+    pub total: usize,
+    /// Added or retried; the rest were done or already queued.
+    pub new: usize,
+}
+
+impl EnqueueReport {
+    fn record(&mut self, input: &str, added: Result<Added>) {
+        match added {
+            Ok(Added::New(id)) => self.added.push(id),
+            Ok(Added::Retried(id)) => self.retried.push(id),
+            Ok(Added::AlreadyOpen(id)) => self.already_queued.push(id),
+            Ok(Added::AlreadyDone { note_path, .. }) => {
+                self.already_done.push((input.to_string(), note_path))
+            }
+            Err(e @ (Error::UnsupportedUrl(_) | Error::NotYetSupported(_))) => {
+                self.rejected.push((input.to_string(), e.to_string()))
+            }
+            Err(e) => self.errors.push((input.to_string(), e.to_string())),
+        }
+    }
+}
+
+/// What pasting a line would do, before anything is added (PDA IN-4:
+/// "Channel X: 312 videos, 40 new").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Preview {
+    pub input: String,
+    /// The channel, playlist or profile; `None` for a single video.
+    pub title: Option<String>,
+    pub total: usize,
+    /// Neither done nor already on its way.
+    pub new: usize,
+    pub error: Option<String>,
+}
+
+/// Listings are reused this long, so a preview and the enqueue after it
+/// list a channel once.
+const LISTING_TTL: Duration = Duration::from_secs(10 * 60);
+
+#[derive(Default)]
+struct Pacer {
+    last: Option<Instant>,
+    reels: u32,
 }
 
 /// The label a job row shows (PDA Q-1).
@@ -113,6 +191,11 @@ pub struct Queue<F, T, L> {
     downloads: Semaphore,
     whisper: Semaphore,
     llm_slots: Semaphore,
+    instagram: Semaphore,
+    pacer: Mutex<Pacer>,
+    listings: Mutex<HashMap<String, (Instant, Collection)>>,
+    /// Caps how many videos a collection expands to (live tests, `--limit`).
+    expand_limit: Option<usize>,
     wake: Notify,
     paused: AtomicBool,
     events: broadcast::Sender<JobEvent>,
@@ -136,6 +219,7 @@ pub struct QueueParts<F, T, L> {
     pub work_dir: PathBuf,
     pub out_dir: PathBuf,
     pub limits: Limits,
+    pub expand_limit: Option<usize>,
 }
 
 impl<F, T, L> Queue<F, T, L>
@@ -153,6 +237,7 @@ where
             work_dir,
             out_dir,
             limits,
+            expand_limit,
         } = parts;
         Arc::new(Queue {
             db,
@@ -164,6 +249,10 @@ where
             downloads: Semaphore::new(limits.downloads.max(1)),
             whisper: Semaphore::new(limits.whisper.max(1)),
             llm_slots: Semaphore::new(limits.llm.max(1)),
+            instagram: Semaphore::new(1),
+            pacer: Mutex::new(Pacer::default()),
+            listings: Mutex::new(HashMap::new()),
+            expand_limit,
             limits,
             wake: Notify::new(),
             paused: AtomicBool::new(false),
@@ -185,35 +274,160 @@ where
             batch_id: Uuid::new_v4(),
             ..Default::default()
         };
-        for input in inputs
-            .iter()
-            .map(|s| s.as_ref().trim())
-            .filter(|s| !s.is_empty())
-        {
-            match self.add_line(report.batch_id, input).await {
-                Ok(Added::New(id)) => report.added.push(id),
-                Ok(Added::Retried(id)) => report.retried.push(id),
-                Ok(Added::AlreadyOpen(id)) => report.already_queued.push(id),
-                Ok(Added::AlreadyDone { note_path, .. }) => {
-                    report.already_done.push((input.to_string(), note_path))
+        let batch_id = report.batch_id;
+        for input in lines(inputs) {
+            let source = match Source::parse(input) {
+                Ok(source) => source,
+                Err(e) => {
+                    report.record(input, Err(e));
+                    continue;
                 }
-                Err(e @ (Error::UnsupportedUrl(_) | Error::NotYetSupported(_))) => {
-                    report.rejected.push((input.to_string(), e.to_string()))
-                }
-                Err(e) => report.errors.push((input.to_string(), e.to_string())),
+            };
+            if let Some(key) = source.video_key() {
+                let added =
+                    db::add_job(&self.db, batch_id, input, &source.canonical_url(), &key).await;
+                report.record(input, added);
+                continue;
             }
+            // A collection: every video in it, tagged with the pasted line.
+            let collection = match self.collection(&source).await {
+                Ok(c) => c,
+                Err(e) => {
+                    report.errors.push((input.to_string(), e.to_string()));
+                    continue;
+                }
+            };
+            let mut summary = CollectionReport {
+                input: input.to_string(),
+                title: collection.title.clone(),
+                total: collection.videos.len(),
+                new: 0,
+            };
+            for video in &collection.videos {
+                let added = db::add_job(&self.db, batch_id, input, &video.url, &video.key).await;
+                if matches!(added, Ok(Added::New(_) | Added::Retried(_))) {
+                    summary.new += 1;
+                }
+                report.record(&video.url, added);
+            }
+            report.collections.push(summary);
         }
         self.wake.notify_one();
         Ok(report)
     }
 
-    async fn add_line(&self, batch_id: Uuid, input: &str) -> Result<Added> {
-        let source = Source::parse(input)?;
-        // Expanding channels, playlists and profiles is build step 3.
-        let key = source
-            .video_key()
-            .ok_or(Error::NotYetSupported(source.kind()))?;
-        db::add_job(&self.db, batch_id, input, &source.canonical_url(), &key).await
+    /// Counts what each line would add, without adding anything.
+    pub async fn preview<S: AsRef<str>>(&self, inputs: &[S]) -> Vec<Preview> {
+        let mut previews = Vec::new();
+        for input in lines(inputs) {
+            let mut preview = Preview {
+                input: input.to_string(),
+                title: None,
+                total: 0,
+                new: 0,
+                error: None,
+            };
+            let counted = async {
+                let source = Source::parse(input)?;
+                let keys = match source.video_key() {
+                    Some(key) => vec![key],
+                    None => {
+                        let collection = self.collection(&source).await?;
+                        preview.title = Some(collection.title);
+                        collection.videos.into_iter().map(|v| v.key).collect()
+                    }
+                };
+                let known = db::known_keys(&self.db, &keys).await?;
+                Ok::<_, Error>((
+                    keys.len(),
+                    keys.iter().filter(|k| !known.contains(*k)).count(),
+                ))
+            };
+            match counted.await {
+                Ok((total, new)) => (preview.total, preview.new) = (total, new),
+                Err(e) => preview.error = Some(e.to_string()),
+            }
+            previews.push(preview);
+        }
+        previews
+    }
+
+    /// A collection's videos, listed once per [`LISTING_TTL`].
+    async fn collection(&self, source: &Source) -> Result<Collection> {
+        let url = source.canonical_url();
+        if let Some((at, cached)) = self.cached_listings().get(&url)
+            && at.elapsed() < LISTING_TTL
+        {
+            return Ok(cached.clone());
+        }
+        let collection = {
+            let _turn = self
+                .instagram_turn(matches!(source, Source::InstagramProfile { .. }), false)
+                .await?;
+            expand::expand(&self.engine.fetcher, source, self.expand_limit).await?
+        };
+        self.cached_listings()
+            .insert(url, (Instant::now(), collection.clone()));
+        Ok(collection)
+    }
+
+    fn cached_listings(&self) -> std::sync::MutexGuard<'_, HashMap<String, (Instant, Collection)>> {
+        self.listings.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Waits for Instagram's turn: one request at a time, spaced out, with a
+    /// longer break every [`Pacing::batch`] reels. Other sites pass straight
+    /// through. The turn ends when the returned guard is dropped.
+    async fn instagram_turn(
+        &self,
+        instagram: bool,
+        new_reel: bool,
+    ) -> Result<Option<InstagramTurn<'_>>> {
+        if !instagram {
+            return Ok(None);
+        }
+        let permit = self.instagram.acquire().await.map_err(stopped)?;
+        let pacing = self.limits.instagram;
+        let wait = {
+            let mut pacer = self.pacer.lock().unwrap_or_else(|e| e.into_inner());
+            let mut gap = pacing.gap;
+            if new_reel {
+                if pacing.batch > 0 && pacer.reels > 0 && pacer.reels.is_multiple_of(pacing.batch) {
+                    gap = gap.max(pacing.pause);
+                }
+                pacer.reels += 1;
+            }
+            pacer
+                .last
+                .map(|last| (last + gap).saturating_duration_since(Instant::now()))
+                .unwrap_or_default()
+        };
+        if !wait.is_zero() {
+            tracing::debug!(secs = wait.as_secs_f32(), "pacing Instagram requests");
+            tokio::time::sleep(wait).await;
+        }
+        Ok(Some(InstagramTurn {
+            _permit: permit,
+            pacer: &self.pacer,
+        }))
+    }
+
+    /// Parks every queued Instagram job after a block (PDA IG-5).
+    async fn pause_instagram(&self, reason: &str) {
+        let wait = self.limits.instagram.block_wait;
+        match db::wait_queued_platform(&self.db, "instagram", reason, wait).await {
+            Ok(parked) => {
+                tracing::warn!(
+                    parked = parked.len(),
+                    minutes = wait.as_secs() / 60,
+                    "Instagram is blocking; pausing its jobs"
+                );
+                for (id, stage) in parked {
+                    self.emit(id, stage, Status::Waiting, Some(reason.to_string()));
+                }
+            }
+            Err(e) => tracing::error!(error = %e, "could not pause the queued Instagram jobs"),
+        }
     }
 
     /// Runs until `shutdown` fires. Jobs in flight at shutdown stay
@@ -397,6 +611,12 @@ where
                 self.record_wait(job.id, job.stage, &e.to_string(), e.retry_after())
                     .await;
             }
+            Err(e @ Error::InstagramBlocked(_)) => {
+                let reason = e.to_string();
+                self.record_wait(job.id, job.stage, &reason, self.limits.instagram.block_wait)
+                    .await;
+                self.pause_instagram(&reason).await;
+            }
             Err(e) => {
                 tracing::warn!(job = job.id, key = %job.video_key, reason = %e, "job failed");
                 self.record_failure(job.id, job.stage, &e.to_string()).await;
@@ -488,6 +708,9 @@ where
 
     async fn stage_metadata(&self, job: &Job) -> Result<Stage> {
         let meta = {
+            // Instagram's turn first: waiting for it shouldn't hold a
+            // download slot YouTube jobs could use.
+            let _turn = self.instagram_turn(is_instagram(job), true).await?;
             let _slot = self.downloads.acquire().await.map_err(stopped)?;
             self.engine.metadata(&job.url).await?
         };
@@ -509,6 +732,7 @@ where
             .await
             .map_err(fs_err("create folder", job_dir))?;
         let fetched = {
+            let _turn = self.instagram_turn(is_instagram(job), false).await?;
             let _slot = self.downloads.acquire().await.map_err(stopped)?;
             self.engine.fetch(&meta, &job.url, job_dir).await?
         };
@@ -821,6 +1045,31 @@ where
         Ok(db::load_transcript(&self.db, &job.video_key)
             .await?
             .is_some())
+    }
+}
+
+/// Non-blank pasted lines, trimmed.
+fn lines<S: AsRef<str>>(inputs: &[S]) -> impl Iterator<Item = &str> {
+    inputs
+        .iter()
+        .map(|s| s.as_ref().trim())
+        .filter(|s| !s.is_empty())
+}
+
+fn is_instagram(job: &Job) -> bool {
+    job.video_key.starts_with("instagram:")
+}
+
+/// Holds Instagram's single request slot; records when the request ended
+/// so the next one is spaced from it.
+struct InstagramTurn<'a> {
+    _permit: SemaphorePermit<'a>,
+    pacer: &'a Mutex<Pacer>,
+}
+
+impl Drop for InstagramTurn<'_> {
+    fn drop(&mut self) {
+        self.pacer.lock().unwrap_or_else(|e| e.into_inner()).last = Some(Instant::now());
     }
 }
 

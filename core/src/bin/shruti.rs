@@ -1,7 +1,8 @@
 //! Dev CLI until the app's UI exists (build steps 4–5):
 //!
 //! ```text
-//! shruti [--out DIR] <link>…        queue links, show progress, wait for them
+//! shruti [--out DIR] [--limit N] <link>…  queue links, show progress, wait for them
+//! shruti --list [--limit N] <link>…  count what a paste would add; adds nothing
 //! shruti --once [--out DIR] <link>…  one link at a time, no database or LLM
 //! shruti --reclean <link>…           re-run cleanup from the stored transcript
 //! shruti --test-llm                  list the provider's models, time a request
@@ -36,6 +37,7 @@ enum Mode {
     Run,
     Once,
     Reclean,
+    List,
     TestLlm,
     SetKey(ProviderKind),
 }
@@ -43,11 +45,14 @@ enum Mode {
 struct Args {
     mode: Mode,
     out_dir: PathBuf,
+    /// Videos per channel, playlist or profile, at most.
+    limit: Option<usize>,
     links: Vec<String>,
 }
 
 const USAGE: &str = "usage:
-  shruti [--out DIR] <link>…
+  shruti [--out DIR] [--limit N] <link>…
+  shruti --list [--limit N] <link>…
   shruti --once [--out DIR] <link>…
   shruti --reclean <link>…
   shruti --test-llm
@@ -81,6 +86,7 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Option<Args> {
     let mut args = Args {
         mode: Mode::Run,
         out_dir: PathBuf::from("out"),
+        limit: None,
         links: Vec::new(),
     };
     while let Some(arg) = raw.next() {
@@ -88,13 +94,18 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Option<Args> {
             "--out" | "-o" => args.out_dir = raw.next()?.into(),
             "--once" => args.mode = Mode::Once,
             "--reclean" => args.mode = Mode::Reclean,
+            "--list" => args.mode = Mode::List,
+            "--limit" => args.limit = Some(raw.next()?.parse().ok().filter(|n| *n > 0)?),
             "--test-llm" => args.mode = Mode::TestLlm,
             "--set-key" => args.mode = Mode::SetKey(ProviderKind::parse(&raw.next()?)?),
             "-h" | "--help" => return None,
             _ => args.links.push(arg),
         }
     }
-    let needs_links = matches!(args.mode, Mode::Run | Mode::Once | Mode::Reclean);
+    let needs_links = matches!(
+        args.mode,
+        Mode::Run | Mode::Once | Mode::Reclean | Mode::List
+    );
     (needs_links != args.links.is_empty()).then_some(args)
 }
 
@@ -104,6 +115,7 @@ async fn run(args: Args) -> Result<bool, String> {
         Mode::SetKey(kind) => set_key(kind).await,
         Mode::TestLlm => test_llm(&config).await,
         Mode::Once => run_once(&engine(&config).await?, &args).await,
+        Mode::List => list(config, &args).await,
         Mode::Run | Mode::Reclean => run_queue(config, &args).await,
     }
 }
@@ -164,15 +176,14 @@ async fn test_llm(config: &Config) -> Result<bool, String> {
     }
 }
 
-/// Returns whether every link produced a note.
-async fn run_queue(config: Config, args: &Args) -> Result<bool, String> {
-    let engine = engine(&config).await?;
+async fn build_queue(config: &Config, args: &Args) -> Result<Arc<CliQueue>, String> {
+    let engine = engine(config).await?;
     let pool = db::connect(&config.database_url)
         .await
         .map_err(|e| e.to_string())?;
     let llm = config.build_llm().await.map_err(|e| e.to_string())?;
     eprintln!("llm: {}", llm.provider().label());
-    let queue = Queue::new(QueueParts {
+    Ok(Queue::new(QueueParts {
         db: pool,
         engine,
         llm,
@@ -180,7 +191,47 @@ async fn run_queue(config: Config, args: &Args) -> Result<bool, String> {
         work_dir: config.work_dir.clone(),
         out_dir: args.out_dir.clone(),
         limits: config.limits,
-    });
+        expand_limit: args.limit,
+    }))
+}
+
+/// Prints what each line would add (PDA IN-4); returns whether all listed.
+async fn list(config: Config, args: &Args) -> Result<bool, String> {
+    let queue = build_queue(&config, args).await?;
+    let mut ok = true;
+    for p in queue.preview(&args.links).await {
+        match (&p.error, &p.title) {
+            (Some(e), _) => {
+                println!(
+                    "skip  {}
+      {}",
+                    printable(&p.input),
+                    printable(e)
+                );
+                ok = false;
+            }
+            (None, Some(title)) => println!(
+                "list  {}: {} videos, {} new",
+                printable(title),
+                p.total,
+                p.new
+            ),
+            (None, None) => {
+                let state = if p.new == 1 {
+                    "new"
+                } else {
+                    "already done or queued"
+                };
+                println!("video {}  ({state})", printable(&p.input));
+            }
+        }
+    }
+    Ok(ok)
+}
+
+/// Returns whether every link produced a note.
+async fn run_queue(config: Config, args: &Args) -> Result<bool, String> {
+    let queue = build_queue(&config, args).await?;
     let events = queue.subscribe();
     let (batch, clean_paste) = match args.mode {
         Mode::Reclean => reclean_batch(&queue, &args.links).await?,
@@ -237,6 +288,14 @@ async fn reclean_batch(queue: &CliQueue, links: &[String]) -> Result<(HashSet<i6
 }
 
 fn print_report(report: &EnqueueReport) {
+    for c in &report.collections {
+        println!(
+            "list  {}: {} videos, {} new",
+            printable(&c.title),
+            c.total,
+            c.new
+        );
+    }
     for (input, reason) in report.rejected.iter().chain(&report.errors) {
         println!("skip  {}\n      {}", printable(input), printable(reason));
     }

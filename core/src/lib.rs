@@ -10,6 +10,7 @@ pub mod cleanup;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod expand;
 pub mod folders;
 pub mod llm;
 pub mod metadata;

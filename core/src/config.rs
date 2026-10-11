@@ -128,6 +128,17 @@ impl Config {
         if let Some(v) = var("SHRUTI_DOWNLOADS").filter(|v| !v.is_empty()) {
             c.limits.downloads = number("SHRUTI_DOWNLOADS", &v)?.max(1) as usize;
         }
+        // Instagram pacing (PDA IG-3).
+        let ig = &mut c.limits.instagram;
+        if let Some(v) = var("SHRUTI_IG_DELAY_SECS").filter(|v| !v.is_empty()) {
+            ig.gap = std::time::Duration::from_secs(number("SHRUTI_IG_DELAY_SECS", &v)?.into());
+        }
+        if let Some(v) = var("SHRUTI_IG_BATCH").filter(|v| !v.is_empty()) {
+            ig.batch = number("SHRUTI_IG_BATCH", &v)?;
+        }
+        if let Some(v) = var("SHRUTI_IG_PAUSE_SECS").filter(|v| !v.is_empty()) {
+            ig.pause = std::time::Duration::from_secs(number("SHRUTI_IG_PAUSE_SECS", &v)?.into());
+        }
         if let Some(v) = var("SHRUTI_LLM_PROVIDER").filter(|v| !v.is_empty()) {
             c.llm.kind = ProviderKind::parse(&v).ok_or_else(|| Error::Parse {
                 what: "settings",
@@ -384,6 +395,9 @@ mod tests {
                 ("SHRUTI_DATABASE_URL", "postgres://x@db/other"),
                 ("SHRUTI_WORK_DIR", "/fast/work"),
                 ("SHRUTI_DOWNLOADS", "2"),
+                ("SHRUTI_IG_DELAY_SECS", "5"),
+                ("SHRUTI_IG_BATCH", "10"),
+                ("SHRUTI_IG_PAUSE_SECS", "120"),
             ]),
         )
         .unwrap();
@@ -398,6 +412,11 @@ mod tests {
         assert_eq!(c.database_url, "postgres://x@db/other");
         assert_eq!(c.work_dir, PathBuf::from("/fast/work"));
         assert_eq!(c.limits.downloads, 2);
+        let ig = c.limits.instagram;
+        assert_eq!(
+            (ig.gap.as_secs(), ig.batch, ig.pause.as_secs()),
+            (5, 10, 120)
+        );
     }
 
     #[test]

@@ -178,6 +178,9 @@ mod tests {
             self.calls.push(format!("captions {} {url}", track.code));
             (self.captions)()
         }
+        async fn list(&self, _: &str, _: Option<usize>) -> Result<crate::expand::Listing> {
+            unreachable!("the pipeline never lists")
+        }
         async fn audio(&self, url: &str, dir: &Path) -> Result<PathBuf> {
             self.calls.push(format!("audio {url}"));
             if self.audio_fails {

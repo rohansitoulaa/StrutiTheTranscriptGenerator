@@ -56,6 +56,10 @@ struct Shared {
     llm_fail: Mutex<Option<LlmError>>,
     clean_prefix: Mutex<String>,
     clean_override: Mutex<Option<String>>,
+    /// Every Instagram request fails as throttled while set.
+    instagram_blocked: AtomicBool,
+    /// Flat listings by URL: entries, or yt-dlp's stderr for a failure.
+    listings: Mutex<Vec<(String, std::result::Result<crate::expand::Listing, String>)>>,
 }
 
 impl Shared {
@@ -89,7 +93,15 @@ struct FakeFetcher {
 fn id_of(url: &str) -> String {
     match Source::parse(url).unwrap() {
         Source::YouTubeVideo { id } => id,
+        Source::InstagramReel { shortcode } => shortcode,
         other => panic!("unexpected {other:?}"),
+    }
+}
+
+fn platform_of(url: &str) -> Platform {
+    match Source::parse(url).unwrap() {
+        Source::InstagramReel { .. } => Platform::Instagram,
+        _ => Platform::YouTube,
     }
 }
 
@@ -97,6 +109,13 @@ impl Fetcher for FakeFetcher {
     async fn metadata(&self, url: &str) -> Result<VideoMeta> {
         let id = id_of(url);
         self.shared.call(format!("metadata {id}"));
+        if platform_of(url) == Platform::Instagram
+            && self.shared.instagram_blocked.load(Ordering::SeqCst)
+        {
+            return Err(Error::InstagramBlocked(
+                "rate-limit reached or login required".into(),
+            ));
+        }
         if self.shared.fail_metadata.lock().unwrap().contains(&id) {
             return Err(Error::ToolFailed {
                 tool: "yt-dlp",
@@ -106,7 +125,7 @@ impl Fetcher for FakeFetcher {
         }
         let captions = id.starts_with("cap");
         Ok(VideoMeta {
-            platform: Platform::YouTube,
+            platform: platform_of(url),
             url: url.to_string(),
             title: format!("Video {id}"),
             channel: Some("chan".into()),
@@ -143,6 +162,24 @@ impl Fetcher for FakeFetcher {
             end_ms: 900,
             text: "caption words.".into(),
         }])
+    }
+
+    async fn list(&self, url: &str, limit: Option<usize>) -> Result<crate::expand::Listing> {
+        self.shared.call(format!("list {url}"));
+        let listings = self.shared.listings.lock().unwrap();
+        let (_, result) = listings
+            .iter()
+            .find(|(u, _)| u == url)
+            .unwrap_or_else(|| panic!("no listing for {url}"));
+        let mut listing = result.clone().map_err(|stderr| Error::ToolFailed {
+            tool: "yt-dlp",
+            status: "exit status: 1".into(),
+            stderr,
+        })?;
+        if let Some(n) = limit {
+            listing.entries.truncate(n);
+        }
+        Ok(listing)
     }
 
     async fn audio(&self, url: &str, dir: &Path) -> Result<PathBuf> {
@@ -266,6 +303,7 @@ fn build_queue(
         work_dir: work.to_path_buf(),
         out_dir: out.to_path_buf(),
         limits,
+        expand_limit: None,
     })
 }
 
@@ -417,19 +455,13 @@ async fn enqueue_sorts_every_line_into_one_bucket(pool: PgPool) {
             link("whisperAAAA"),
             "   ".to_string(),
             "not a link".to_string(),
-            "https://www.youtube.com/@kolejain".to_string(),
         ])
         .await
         .unwrap();
     assert_eq!(report.added.len(), 1);
     assert_eq!(report.already_queued, report.added);
-    assert_eq!(report.rejected.len(), 2);
+    assert_eq!(report.rejected.len(), 1);
     assert!(report.rejected[0].1.contains("not a supported link"));
-    assert!(
-        report.rejected[1]
-            .1
-            .contains("channel links are not supported yet")
-    );
 
     let (token, handle) = start(&h);
     settle(&h).await;
@@ -482,8 +514,7 @@ async fn one_failure_never_stops_the_queue_and_retry_resumes(pool: PgPool) {
 async fn whisper_runs_one_at_a_time_while_downloads_overlap_it(pool: PgPool) {
     let limits = Limits {
         downloads: 2,
-        whisper: 1,
-        llm: 1,
+        ..Limits::default()
     };
     let h = harness(
         pool,
@@ -1308,4 +1339,214 @@ async fn reclean_of_a_moved_and_edited_note_writes_a_copy_beside_it(pool: PgPool
 fn job_folders_are_safe_names() {
     assert_eq!(job_dir_name("youtube:abc-_D"), "youtube_abc-_D");
     assert_eq!(job_dir_name("instagram:../x"), "instagram____x");
+}
+
+fn listing(title: &str, ids: &[&str]) -> std::result::Result<crate::expand::Listing, String> {
+    Ok(crate::expand::Listing {
+        title: Some(format!("{title} - Videos")),
+        channel: Some(title.into()),
+        entries: ids
+            .iter()
+            .map(|id| crate::expand::ListedVideo {
+                url: link(id),
+                title: Some(format!("Video {id}")),
+            })
+            .collect(),
+    })
+}
+
+const CHANNEL: &str = "https://www.youtube.com/@fakechan";
+
+fn set_channel(h: &Harness, ids: &[&str]) {
+    *h.shared.listings.lock().unwrap() = vec![
+        (format!("{CHANNEL}/videos"), listing("Fake Chan", ids)),
+        (
+            format!("{CHANNEL}/shorts"),
+            Err("ERROR: [youtube:tab] @fakechan: This channel does not have a shorts tab".into()),
+        ),
+    ];
+}
+
+/// The same database and folders, with a fresh queue (and listing cache),
+/// as on a later run.
+fn later_run(h: &Harness) -> Arc<TestQueue> {
+    build_queue(
+        &h.pool,
+        &h.shared,
+        &h.work,
+        &h.out,
+        Limits::default(),
+        (Duration::from_millis(10), Duration::from_millis(10)),
+    )
+}
+
+#[sqlx::test]
+async fn a_pasted_channel_expands_and_a_rerun_adds_only_new_videos(pool: PgPool) {
+    // PDA §4.1 acceptance: a channel, a single video and a line of junk.
+    let h = quick(pool);
+    set_channel(&h, &["whisperAAAA", "capBBBBBBBB"]);
+    let report = h
+        .queue
+        .enqueue(&[CHANNEL.to_string(), link("whisperCCCC"), "junk".into()])
+        .await
+        .unwrap();
+    assert_eq!(report.added.len(), 3);
+    assert_eq!(report.rejected.len(), 1);
+    assert_eq!(
+        report.collections,
+        [CollectionReport {
+            input: CHANNEL.into(),
+            title: "Fake Chan".into(),
+            total: 2,
+            new: 2
+        }]
+    );
+    let jobs = db::list_jobs(&h.pool, 10).await.unwrap();
+    let expanded: Vec<&Job> = jobs.iter().filter(|j| j.input == CHANNEL).collect();
+    assert_eq!(expanded.len(), 2, "expanded jobs remember the pasted line");
+    let (token, handle) = start(&h);
+    settle(&h).await;
+    stop(token, handle).await;
+
+    // Next month: one new upload.
+    set_channel(&h, &["whisperDDDD", "whisperAAAA", "capBBBBBBBB"]);
+    let queue = later_run(&h);
+    let preview = queue.preview(&[CHANNEL]).await;
+    assert_eq!(
+        preview,
+        [Preview {
+            input: CHANNEL.into(),
+            title: Some("Fake Chan".into()),
+            total: 3,
+            new: 1,
+            error: None
+        }]
+    );
+    let again = queue.enqueue(&[CHANNEL]).await.unwrap();
+    assert_eq!(again.added.len(), 1);
+    assert_eq!(again.already_done.len(), 2);
+    assert_eq!(again.collections[0].new, 1);
+    assert_eq!(
+        h.shared.count(&format!("list {CHANNEL}/videos")),
+        2,
+        "the preview's listing is reused by the enqueue after it"
+    );
+}
+
+#[sqlx::test]
+async fn a_collection_that_cant_be_listed_is_reported_and_the_rest_go_in(pool: PgPool) {
+    let h = quick(pool);
+    let playlist = "https://www.youtube.com/playlist?list=PLbroken";
+    *h.shared.listings.lock().unwrap() = vec![(
+        playlist.into(),
+        Err("ERROR: [youtube:tab] This playlist does not exist".into()),
+    )];
+    let report = h
+        .queue
+        .enqueue(&[playlist.to_string(), link("whisperAAAA")])
+        .await
+        .unwrap();
+    assert_eq!(report.added.len(), 1);
+    assert_eq!(report.errors.len(), 1);
+    assert!(
+        report.errors[0].1.contains("playlist does not exist"),
+        "{:?}",
+        report.errors
+    );
+    assert!(report.collections.is_empty());
+}
+
+fn reel(code: &str) -> String {
+    format!("https://www.instagram.com/reel/{code}/")
+}
+
+#[sqlx::test]
+async fn an_instagram_block_parks_every_instagram_job_and_youtube_carries_on(pool: PgPool) {
+    let limits = Limits {
+        downloads: 1,
+        instagram: Pacing {
+            gap: Duration::ZERO,
+            ..Pacing::default()
+        },
+        ..Limits::default()
+    };
+    let h = harness(
+        pool,
+        limits,
+        Duration::from_millis(10),
+        Duration::from_millis(10),
+    );
+    h.shared.instagram_blocked.store(true, Ordering::SeqCst);
+    let mut links = vec![link("whisperAAAA")];
+    links.extend(
+        [
+            "igAAAAAAAA1",
+            "igAAAAAAAA2",
+            "igAAAAAAAA3",
+            "igAAAAAAAA4",
+            "igAAAAAAAA5",
+            "igAAAAAAAA6",
+        ]
+        .map(reel),
+    );
+    h.queue.enqueue(&links).await.unwrap();
+    let (token, handle) = start(&h);
+    let jobs = settle(&h).await;
+    stop(token, handle).await;
+
+    for job in &jobs {
+        if job.video_key.starts_with("instagram:") {
+            assert_eq!(job.status, Status::Waiting, "{job:#?}");
+            assert!(
+                job.reason
+                    .as_deref()
+                    .unwrap()
+                    .contains("Instagram is limiting requests")
+            );
+        } else {
+            assert_eq!(job.status, Status::Done, "{job:#?}");
+        }
+    }
+    let tried = h
+        .shared
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("metadata ig"))
+        .count();
+    assert!(
+        tried < 6,
+        "queued Instagram jobs were parked, not tried ({tried} tried)"
+    );
+}
+
+#[sqlx::test]
+async fn instagram_requests_are_spaced_with_a_longer_pause_every_batch(pool: PgPool) {
+    let limits = Limits {
+        instagram: Pacing {
+            gap: Duration::from_millis(60),
+            batch: 2,
+            pause: Duration::from_millis(250),
+            ..Pacing::default()
+        },
+        ..Limits::default()
+    };
+    let h = harness(pool, limits, Duration::ZERO, Duration::ZERO);
+    let q = &h.queue;
+    let started = Instant::now();
+    assert!(
+        q.instagram_turn(false, true).await.unwrap().is_none(),
+        "YouTube isn't paced"
+    );
+    drop(q.instagram_turn(true, true).await.unwrap());
+    let first = started.elapsed();
+    drop(q.instagram_turn(true, true).await.unwrap());
+    let second = started.elapsed();
+    drop(q.instagram_turn(true, true).await.unwrap());
+    let third = started.elapsed();
+    assert!(first < Duration::from_millis(50), "{first:?}");
+    assert!(second - first >= Duration::from_millis(60), "{second:?}");
+    assert!(
+        third - second >= Duration::from_millis(250),
+        "every 2 reels: {third:?}"
+    );
 }

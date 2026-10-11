@@ -379,6 +379,46 @@ pub async fn wait(
     Ok(done.rows_affected() == 1)
 }
 
+/// Parks every queued job of one platform (`instagram`), e.g. when it
+/// starts blocking requests (PDA IG-5). Returns each parked job and stage.
+pub async fn wait_queued_platform(
+    pool: &PgPool,
+    platform: &str,
+    reason: &str,
+    retry_in: std::time::Duration,
+) -> Result<Vec<(i64, Stage)>> {
+    let rows = sqlx::query(
+        "UPDATE jobs SET status = 'waiting', reason = $2,
+                retry_at = now() + make_interval(secs => $3), updated_at = now()
+         WHERE status = 'queued' AND starts_with(video_key, $1 || ':')
+         RETURNING id, stage",
+    )
+    .bind(platform)
+    .bind(reason)
+    .bind(retry_in.as_secs_f64())
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| Ok((r.try_get("id")?, Stage::parse(r.try_get("stage")?)?)))
+        .collect()
+}
+
+/// Which of these videos are already done or on their way (queued,
+/// running, waiting). Failed and cancelled ones would be worked on again.
+pub async fn known_keys(
+    pool: &PgPool,
+    keys: &[String],
+) -> Result<std::collections::HashSet<String>> {
+    let known: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT video_key FROM jobs
+         WHERE video_key = ANY($1) AND status IN ('done', 'queued', 'running', 'waiting')",
+    )
+    .bind(keys)
+    .fetch_all(pool)
+    .await?;
+    Ok(known.into_iter().collect())
+}
+
 pub async fn set_folder(pool: &PgPool, id: i64, folder: &str) -> Result<bool> {
     let done = sqlx::query(
         "UPDATE jobs SET folder = $2, updated_at = now() WHERE id = $1 AND status = 'running'",
@@ -1040,6 +1080,58 @@ mod tests {
             order.push(job.id);
         }
         assert_eq!(order, [ids[2], ids[1], ids[0]]);
+    }
+
+    #[sqlx::test]
+    async fn a_platform_s_queued_jobs_can_be_parked_together(pool: PgPool) {
+        for key in ["instagram:a", "instagram:b", "youtube:c", "instagram:d"] {
+            add(&pool, key).await;
+        }
+        // d is already running: only queued jobs are parked.
+        sqlx::query("UPDATE jobs SET status = 'running' WHERE video_key = 'instagram:d'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let parked = wait_queued_platform(
+            &pool,
+            "instagram",
+            "blocked",
+            std::time::Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(parked.len(), 2);
+        assert!(parked.iter().all(|(_, stage)| *stage == Stage::Metadata));
+        let statuses: Vec<(String, String)> =
+            sqlx::query_as("SELECT video_key, status FROM jobs ORDER BY video_key")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let s = |k: &str| statuses.iter().find(|(key, _)| key == k).unwrap().1.clone();
+        assert_eq!(s("instagram:a"), "waiting");
+        assert_eq!(s("instagram:b"), "waiting");
+        assert_eq!(s("youtube:c"), "queued");
+        assert_eq!(s("instagram:d"), "running");
+    }
+
+    #[sqlx::test]
+    async fn known_keys_are_done_or_on_their_way(pool: PgPool) {
+        for key in ["youtube:a", "youtube:b", "youtube:c"] {
+            add(&pool, key).await;
+        }
+        sqlx::query("UPDATE jobs SET status = 'cancelled' WHERE video_key = 'youtube:b'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET status = 'failed' WHERE video_key = 'youtube:c'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let keys: Vec<String> = ["youtube:a", "youtube:b", "youtube:c", "youtube:z"]
+            .map(String::from)
+            .to_vec();
+        let known = known_keys(&pool, &keys).await.unwrap();
+        assert_eq!(known, ["youtube:a".to_string()].into_iter().collect());
     }
 
     #[sqlx::test]

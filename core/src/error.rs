@@ -40,6 +40,11 @@ pub enum Error {
     #[error("could not read {what}: {reason}")]
     Parse { what: &'static str, reason: String },
 
+    /// 429s or a login wall from Instagram (PDA IG-5): its jobs pause
+    /// rather than fail, and YouTube carries on.
+    #[error("Instagram is limiting requests, so Instagram jobs are paused: {0}")]
+    InstagramBlocked(String),
+
     #[error("no transcript produced: {0}")]
     Empty(String),
 
