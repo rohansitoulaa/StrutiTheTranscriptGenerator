@@ -1038,11 +1038,18 @@ async fn an_unreachable_llm_parks_jobs_until_it_is_back(pool: PgPool) {
     let job = &jobs[0];
     assert_eq!((job.status, job.stage), (Status::Waiting, Stage::Clean));
     assert!(job.reason.as_deref().unwrap().contains("could not connect"));
-    let mut waited = false;
-    while let Ok(e) = events.try_recv() {
-        waited |= e.status == Status::Waiting && e.stage == Stage::Clean;
-    }
-    assert!(waited, "a Waiting event");
+    // The event follows the database write, so it may lag `settle`.
+    let waited = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(e) if e.status == Status::Waiting && e.stage == Stage::Clean => break,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("{e}"),
+            }
+        }
+    })
+    .await;
+    assert!(waited.is_ok(), "a Waiting event");
     assert_eq!(
         h.shared.count("whisper"),
         1,
@@ -1054,6 +1061,33 @@ async fn an_unreachable_llm_parks_jobs_until_it_is_back(pool: PgPool) {
     let jobs = settle(&h).await;
     stop(token, handle).await;
     assert_eq!(jobs[0].status, Status::Done);
+    assert_eq!(h.shared.count("whisper"), 1);
+}
+
+#[sqlx::test]
+async fn a_waiting_job_resumes_by_itself_once_due(pool: PgPool) {
+    let h = quick(pool);
+    *h.shared.llm_fail.lock().unwrap() = Some(LlmError::RateLimited { retry_after: None });
+    let id = h.queue.enqueue(&[link("whisperAAAA")]).await.unwrap().added[0];
+    let (token, handle) = start(&h);
+    assert_eq!(settle(&h).await[0].status, Status::Waiting);
+
+    *h.shared.llm_fail.lock().unwrap() = None;
+    sqlx::query("UPDATE jobs SET retry_at = now() - interval '1 second' WHERE id = $1")
+        .bind(id)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let job = db::get_job(&h.pool, id).await.unwrap().unwrap();
+        if job.status == Status::Done {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never resumed: {job:#?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop(token, handle).await;
     assert_eq!(h.shared.count("whisper"), 1);
 }
 
@@ -1123,6 +1157,7 @@ async fn reclean_rewrites_an_unedited_note_in_place(pool: PgPool) {
         "same note, updated in place"
     );
     assert!(note_of(&again).contains("Revised. spoken words."));
+    assert_eq!(again.folder.as_deref(), Some("Testing/Fakes"));
     assert_eq!(h.shared.count("whisper"), 1, "no re-transcription");
     assert_eq!(h.shared.count("llm sort"), sorts, "no re-filing");
     assert_eq!(count(&h.pool, "SELECT count(*) FROM cleanings").await, 2);
@@ -1169,9 +1204,40 @@ async fn reclean_follows_a_note_moved_in_obsidian(pool: PgPool) {
             .contains("Revised.")
     );
     assert!(!original.exists(), "never moved back");
+    assert_eq!(again.folder.as_deref(), Some("Mine/Picked By Hand"));
     let recorded = db::notes_for(&h.pool, "youtube:whisperAAAA").await.unwrap();
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].path, moved.display().to_string());
+}
+
+#[sqlx::test]
+async fn reclean_of_a_moved_and_edited_note_writes_a_copy_beside_it(pool: PgPool) {
+    let h = quick(pool);
+    let first = finished(&h, "whisperAAAA").await;
+    let original = PathBuf::from(first.note_path.as_ref().unwrap());
+    let moved = h.out.join("Mine/Picked By Hand/renamed.md");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    // Edited, but the frontmatter (and its id) is kept.
+    let edited = format!(
+        "{}\nMy own thoughts.\n",
+        std::fs::read_to_string(&moved).unwrap()
+    );
+    std::fs::write(&moved, &edited).unwrap();
+    *h.shared.clean_prefix.lock().unwrap() = "Revised. ".into();
+
+    let again = reclean(&h, "whisperAAAA").await;
+    assert_eq!(again.status, Status::Done);
+    let copy = PathBuf::from(again.note_path.as_ref().unwrap());
+    assert_ne!(copy, moved);
+    assert_eq!(copy.parent(), moved.parent(), "beside the moved note");
+    assert_eq!(
+        std::fs::read_to_string(&moved).unwrap(),
+        edited,
+        "edit kept"
+    );
+    assert!(note_of(&again).contains("Revised."));
+    assert!(!original.exists());
 }
 
 #[test]

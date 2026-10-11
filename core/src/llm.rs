@@ -122,7 +122,16 @@ impl LlmError {
     /// Whether a job should wait and try again later instead of failing
     /// (PDA CL-8, LLM-6). Only an unusable reply is a real failure.
     pub fn should_wait(&self) -> bool {
-        !matches!(self, LlmError::BadResponse(_))
+        // Exhaustive on purpose: a new variant must decide wait vs fail.
+        match self {
+            LlmError::Unreachable { .. }
+            | LlmError::InvalidKey
+            | LlmError::RateLimited { .. }
+            | LlmError::QuotaExhausted
+            | LlmError::ModelNotFound(_)
+            | LlmError::Server { .. } => true,
+            LlmError::BadResponse(_) => false,
+        }
     }
 
     /// How long to wait before trying again.
@@ -196,7 +205,7 @@ impl LlmClient {
             .request(self.http.get(&url))
             .send()
             .await
-            .map_err(|e| unreachable(&url, e))?;
+            .map_err(|e| unreachable_error(&url, e))?;
         let body: ModelList = parse_body(response).await?;
         let mut ids: Vec<String> = body
             .data
@@ -234,20 +243,31 @@ impl LlmClient {
             ],
             // Low temperature: cleanup is editing, not writing.
             temperature: 0.2,
+            // Gemma 4 (and other reasoning models) otherwise spend the
+            // whole token budget on hidden "thinking" and return an empty
+            // answer; measured on CPU, a cleanup never finished. Only LM
+            // Studio is sent this: cloud APIs may reject the parameter.
+            reasoning_effort: (self.provider.kind == ProviderKind::LmStudio).then_some("none"),
         };
         let response = self
             .request(self.http.post(&url))
             .json(&request)
             .send()
             .await
-            .map_err(|e| unreachable(&url, e))?;
+            .map_err(|e| unreachable_error(&url, e))?;
         let body: ChatResponse = parse_body(response).await?;
         let text = body
             .choices
             .into_iter()
             .next()
             .and_then(|c| c.message.content)
-            .ok_or_else(|| LlmError::BadResponse("the reply had no message".into()))?;
+            .filter(|t| !t.trim().is_empty())
+            .ok_or_else(|| {
+                LlmError::BadResponse(
+                    "the model returned no answer (a reasoning model may have spent it all thinking)"
+                        .into(),
+                )
+            })?;
         Ok(ChatReply {
             text,
             tokens_in: body.usage.as_ref().and_then(|u| u.prompt_tokens),
@@ -271,6 +291,8 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: [Message<'a>; 2],
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -313,7 +335,7 @@ struct ModelEntry {
     id: String,
 }
 
-fn unreachable(url: &str, e: reqwest::Error) -> LlmError {
+fn unreachable_error(url: &str, e: reqwest::Error) -> LlmError {
     let reason = if e.is_timeout() {
         "timed out".to_string()
     } else if e.is_connect() {
@@ -337,15 +359,37 @@ async fn parse_body<T: for<'de> Deserialize<'de>>(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok())
         .map(Duration::from_secs);
-    let body = response
-        .text()
-        .await
-        .map_err(|e| LlmError::BadResponse(format!("could not read the reply: {e}")))?;
+    let body = read_capped(response).await?;
     if status.is_success() {
         return serde_json::from_str(&body)
             .map_err(|e| LlmError::BadResponse(format!("could not parse the reply: {e}")));
     }
     Err(classify(status.as_u16(), &body, retry_after))
+}
+
+/// Replies bigger than this are refused: a cleanup reply is a few hundred
+/// KB at most, and a misbehaving endpoint shouldn't exhaust memory.
+const MAX_REPLY_BYTES: usize = 16 * 1024 * 1024;
+
+async fn read_capped(mut response: reqwest::Response) -> std::result::Result<String, LlmError> {
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_REPLY_BYTES as u64)
+    {
+        return Err(LlmError::BadResponse("the reply is too large".into()));
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| LlmError::BadResponse(format!("could not read the reply: {e}")))?
+    {
+        if bytes.len() + chunk.len() > MAX_REPLY_BYTES {
+            return Err(LlmError::BadResponse("the reply is too large".into()));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Maps an HTTP error to what the queue should do about it.
@@ -536,13 +580,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_server_that_is_not_running_is_unreachable_and_waits() {
-        // Bind and drop a listener to get a port nothing is listening on.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let client = LlmClient::new(provider(format!("http://127.0.0.1:{port}/v1"), None)).unwrap();
+        // Port 1 is privileged: no mock server from a parallel test can be
+        // listening there, unlike a freshly released ephemeral port.
+        let client = LlmClient::new(provider("http://127.0.0.1:1/v1".into(), None)).unwrap();
         let err = client.chat("s", "u").await.unwrap_err();
         assert!(matches!(err, LlmError::Unreachable { .. }), "{err:?}");
         assert!(err.should_wait());
@@ -550,15 +590,99 @@ mod tests {
 
     #[test]
     fn waits_and_backoffs() {
-        assert!(LlmError::InvalidKey.should_wait());
-        assert!(LlmError::QuotaExhausted.should_wait());
-        assert_eq!(
-            LlmError::QuotaExhausted.retry_after(),
-            Duration::from_secs(3600)
+        let server = LlmError::Server {
+            status: 503,
+            body: String::new(),
+        };
+        let unreachable = LlmError::Unreachable {
+            url: "u".into(),
+            reason: "r".into(),
+        };
+        for (e, secs) in [
+            (LlmError::QuotaExhausted, 3600),
+            (LlmError::RateLimited { retry_after: None }, 30),
+            (
+                LlmError::RateLimited {
+                    retry_after: Some(Duration::from_secs(5)),
+                },
+                5,
+            ),
+            (server, 60),
+            (unreachable, 60),
+            (LlmError::ModelNotFound("m".into()), 300),
+            (LlmError::InvalidKey, 300),
+        ] {
+            assert!(e.should_wait(), "{e:?}");
+            assert_eq!(e.retry_after(), Duration::from_secs(secs), "{e:?}");
+        }
+        assert!(!LlmError::BadResponse("x".into()).should_wait());
+    }
+
+    #[tokio::test]
+    async fn lm_studio_requests_ask_for_no_hidden_reasoning() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_partial_json(
+                serde_json::json!({"reasoning_effort": "none"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(completion("ok")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let p = Provider {
+            kind: ProviderKind::LmStudio,
+            ..provider(format!("{}/v1", server.uri()), None)
+        };
+        LlmClient::new(p).unwrap().chat("s", "u").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cloud_requests_never_send_the_lm_studio_reasoning_flag() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(|req: &Request| {
+                let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                assert!(body.get("reasoning_effort").is_none(), "{body}");
+                ResponseTemplate::new(200).set_body_json(completion("ok"))
+            })
+            .mount(&server)
+            .await;
+        let p = Provider {
+            kind: ProviderKind::Gemini,
+            ..provider(format!("{}/v1", server.uri()), Some("k"))
+        };
+        LlmClient::new(p).unwrap().chat("s", "u").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_is_a_failure_not_an_empty_cleanup() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": "", "reasoning_content": "thinking…"}}]
+            })))
+            .mount(&server)
+            .await;
+        let err = client(&server, None).chat("s", "u").await.unwrap_err();
+        assert!(
+            matches!(&err, LlmError::BadResponse(m) if m.contains("no answer")),
+            "{err:?}"
         );
-        assert_eq!(
-            LlmError::RateLimited { retry_after: None }.retry_after(),
-            Duration::from_secs(30)
+    }
+
+    #[tokio::test]
+    async fn oversized_replies_are_refused() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("x".repeat(MAX_REPLY_BYTES + 1)),
+            )
+            .mount(&server)
+            .await;
+        let err = client(&server, None).chat("s", "u").await.unwrap_err();
+        assert!(
+            matches!(&err, LlmError::BadResponse(m) if m.contains("too large")),
+            "{err:?}"
         );
     }
 

@@ -71,10 +71,14 @@ impl FolderTree {
             }
             for topic in visible_dirs(&root.join(&area))? {
                 let description_file = root.join(&area).join(&topic).join(DESCRIPTION_FILE);
-                let description = std::fs::read_to_string(description_file)
-                    .ok()
-                    .map(|d| d.trim().to_string())
-                    .filter(|d| !d.is_empty());
+                let description = match std::fs::read_to_string(&description_file) {
+                    Ok(d) => Some(d.trim().to_string()).filter(|d| !d.is_empty()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        tracing::warn!(file = %description_file.display(), error = %e, "unreadable folder description");
+                        None
+                    }
+                };
                 folders.push(Folder {
                     area: area.clone(),
                     topic,
@@ -109,7 +113,10 @@ fn visible_dirs(dir: &Path) -> Result<Vec<String>> {
     for entry in entries {
         let entry = entry.map_err(fs_err("read folder", dir))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with('.') && entry.path().is_dir() {
+        // `file_type` doesn't follow symlinks: a link out of the vault is
+        // never treated as a folder.
+        let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+        if !name.starts_with('.') && is_dir {
             names.push(name);
         }
     }
@@ -197,15 +204,27 @@ pub(crate) fn interpret(tree: &FolderTree, reply: &str) -> Placement {
     }
     match parsed.new {
         Some(new) => propose(tree, &new.area, &new.topic, new.description),
-        None => Placement::Inbox,
+        None => {
+            tracing::warn!(
+                reply,
+                "the folder sorter's reply named no folder; filing to Inbox"
+            );
+            Placement::Inbox
+        }
     }
 }
 
 /// Applies the naming rules and the near-duplicate check to a proposal.
 fn propose(tree: &FolderTree, area: &str, topic: &str, description: Option<String>) -> Placement {
-    let (Some(area), Some(topic)) = (clean_name(area), clean_name(topic)) else {
+    let (Some(clean_area), Some(clean_topic)) = (clean_name(area), clean_name(topic)) else {
+        tracing::warn!(
+            area,
+            topic,
+            "the folder sorter proposed unusable names; filing to Inbox"
+        );
         return Placement::Inbox;
     };
+    let (area, topic) = (clean_area, clean_topic);
     // A known area under a different spelling: use its exact name.
     let area = tree
         .areas()
@@ -249,8 +268,21 @@ pub(crate) fn clean_name(raw: &str) -> Option<String> {
             }
         })
         .collect();
-    let name: String = words.join(" ").chars().take(MAX_NAME_CHARS).collect();
-    let name = name.trim().to_string();
+    // Cut at a word boundary to fit; a single overlong word is truncated.
+    let mut name = String::new();
+    for word in words {
+        let extra = if name.is_empty() { 0 } else { 1 };
+        if name.len() + extra + word.len() > MAX_NAME_CHARS {
+            if name.is_empty() {
+                name = word.chars().take(MAX_NAME_CHARS).collect();
+            }
+            break;
+        }
+        if extra == 1 {
+            name.push(' ');
+        }
+        name.push_str(&word);
+    }
     (!name.is_empty()).then_some(name)
 }
 
@@ -326,8 +358,20 @@ pub fn place(root: &Path, placement: &Placement) -> Result<PathBuf> {
         && let Some(description) = &folder.description
     {
         let file = dir.join(DESCRIPTION_FILE);
-        if !file.exists() {
-            std::fs::write(&file, format!("{description}\n")).map_err(fs_err("write", &file))?;
+        // `create_new` is atomic: two jobs creating the same new folder at
+        // once can't clobber each other, and a hand-edited one is kept.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                f.write_all(format!("{description}\n").as_bytes())
+                    .map_err(fs_err("write", &file))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(fs_err("create", &file)(e)),
         }
     }
     Ok(dir)
@@ -457,6 +501,15 @@ mod tests {
         assert_eq!(clean_name("2026-10-11 Vlogs").as_deref(), Some("Vlogs"));
         assert_eq!(clean_name("../../etc").as_deref(), Some("Etc"));
         assert_eq!(clean_name("🎥 2026"), None);
+        // Capped at 32 characters on a word boundary.
+        assert_eq!(
+            clean_name("Extraordinarily Comprehensive Encyclopedias").as_deref(),
+            Some("Extraordinarily Comprehensive")
+        );
+        assert_eq!(
+            clean_name("Pneumonoultramicroscopicsilicovolcanoconiosis").map(|n| n.len()),
+            Some(32)
+        );
     }
 
     #[test]

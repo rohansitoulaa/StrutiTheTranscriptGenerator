@@ -25,18 +25,29 @@ pub(crate) async fn run_tool(
     limit: Duration,
 ) -> Result<Output> {
     tracing::debug!(tool, bin = %bin.display(), ?args, "running");
-    let child = tokio::process::Command::new(bin)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    let output = tokio::time::timeout(limit, child)
-        .await
-        .map_err(|_| Error::Timeout {
-            tool,
-            secs: limit.as_secs(),
-        })?
-        .map_err(|source| Error::Spawn { tool, source })?;
+    let mut attempt = 0;
+    let output = loop {
+        let child = tokio::process::Command::new(bin)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let result = tokio::time::timeout(limit, child)
+            .await
+            .map_err(|_| Error::Timeout {
+                tool,
+                secs: limit.as_secs(),
+            })?;
+        match result {
+            // ETXTBSY: the binary was just written (a yt-dlp update) and a
+            // forked child elsewhere still briefly holds it open.
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 5 => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            other => break other.map_err(|source| Error::Spawn { tool, source })?,
+        }
+    };
 
     if !output.status.success() {
         return Err(Error::ToolFailed {

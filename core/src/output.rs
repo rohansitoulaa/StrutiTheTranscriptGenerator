@@ -136,11 +136,32 @@ pub fn render_note(
     fm.push(format!("transcribed: {today}"));
     fm.push(format!("shruti_id: {}", quoted(&meta.key())));
 
-    let body = match cleaned {
+    let body = neutralize_html(&match cleaned {
         Some(c) => c.text.clone(),
         None => transcript.text(),
-    };
+    });
     format!("---\n{}\n---\n\n{}\n", fm.join("\n"), body)
+}
+
+/// Obsidian renders raw HTML in notes, and the body comes from untrusted
+/// video speech via an LLM. `<` that starts a tag becomes `&lt;` (shown as
+/// `<`), so nothing in a transcript can become live markup; "a < b" is left
+/// as it is.
+pub(crate) fn neutralize_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let starts_tag = c == '<'
+            && chars
+                .peek()
+                .is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, '/' | '!' | '?'));
+        if starts_tag {
+            out.push_str("&lt;");
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Hex SHA-256 of a note's content: the fingerprint of what Shruti wrote.
@@ -192,7 +213,9 @@ pub fn find_notes_by_id(root: &Path, video_key: &str) -> Result<Vec<PathBuf>> {
             if name.to_string_lossy().starts_with('.') {
                 continue;
             }
-            if path.is_dir() {
+            // `file_type` doesn't follow symlinks out of the vault.
+            let is_dir = entry.file_type().is_ok_and(|t| t.is_dir());
+            if is_dir {
                 dirs.push(path);
             } else if path.extension().is_some_and(|e| e == "md")
                 && frontmatter_contains(&path, &needle)
@@ -207,8 +230,14 @@ pub fn find_notes_by_id(root: &Path, video_key: &str) -> Result<Vec<PathBuf>> {
 
 fn frontmatter_contains(path: &Path, needle: &str) -> bool {
     use std::io::BufRead;
-    let Ok(file) = std::fs::File::open(path) else {
-        return false;
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %path.display(), error = %e, "unreadable note skipped while looking for it by id");
+            }
+            return false;
+        }
     };
     std::io::BufReader::new(file)
         .lines()
@@ -634,6 +663,21 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn markup_in_transcripts_is_never_live_in_the_note() {
+        assert_eq!(
+            neutralize_html("<script>alert(1)</script> and a < b, x<3"),
+            "&lt;script>alert(1)&lt;/script> and a < b, x<3"
+        );
+        assert_eq!(
+            neutralize_html("<img src=x onerror=y> <!-- c -->"),
+            "&lt;img src=x onerror=y> &lt;!-- c -->"
+        );
+        let mut t = transcript(&["<iframe src=evil>"]);
+        t.language = Some("en".into());
+        assert!(render_note(&zoo(), &t, None, "2026-10-11").ends_with("&lt;iframe src=evil>\n"));
     }
 
     #[test]

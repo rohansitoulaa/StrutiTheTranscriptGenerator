@@ -242,15 +242,26 @@ pub async fn add_job(
 /// and marks it running. `SKIP LOCKED` keeps
 /// two dispatchers from ever taking the same job.
 pub async fn claim_next(pool: &PgPool) -> Result<Option<Job>> {
-    let claimed: Option<i64> = sqlx::query_scalar(
+    // Two queries rather than one `OR`, so each can use its partial index
+    // (`jobs_unfinished`, `jobs_waiting_due`); new work goes first.
+    let mut claimed: Option<i64> = sqlx::query_scalar(
         "UPDATE jobs SET status = 'running', updated_at = now()
-         WHERE id = (SELECT id FROM jobs
-                     WHERE status = 'queued' OR (status = 'waiting' AND retry_at <= now())
+         WHERE id = (SELECT id FROM jobs WHERE status = 'queued'
                      ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
          RETURNING id",
     )
     .fetch_optional(pool)
     .await?;
+    if claimed.is_none() {
+        claimed = sqlx::query_scalar(
+            "UPDATE jobs SET status = 'running', updated_at = now()
+             WHERE id = (SELECT id FROM jobs WHERE status = 'waiting' AND retry_at <= now()
+                         ORDER BY retry_at, id FOR UPDATE SKIP LOCKED LIMIT 1)
+             RETURNING id",
+        )
+        .fetch_optional(pool)
+        .await?;
+    }
     match claimed {
         Some(id) => get_job(pool, id).await,
         None => Ok(None),
@@ -403,29 +414,36 @@ pub async fn add_reclean_job(pool: &PgPool, batch_id: Uuid, video_key: &str) -> 
     .await?;
     let url = url
         .ok_or_else(|| Error::State(format!("{video_key} has no stored transcript to re-clean")))?;
-    let inserted: Option<i64> = sqlx::query_scalar(
-        "INSERT INTO jobs (batch_id, input, url, video_key, stage) VALUES ($1, $2, $3, $2, 'clean')
-         ON CONFLICT (video_key) WHERE status IN ('queued', 'running', 'waiting', 'failed') DO NOTHING
-         RETURNING id",
-    )
-    .bind(batch_id)
-    .bind(video_key)
-    .bind(&url)
-    .fetch_optional(pool)
-    .await?;
-    match inserted {
-        Some(id) => Ok(Added::New(id)),
-        None => {
-            let id: i64 = sqlx::query_scalar(
-                "SELECT id FROM jobs WHERE video_key = $1
-                 AND status IN ('queued', 'running', 'waiting', 'failed')",
-            )
-            .bind(video_key)
-            .fetch_one(pool)
-            .await?;
-            Ok(Added::AlreadyOpen(id))
+    // The open job blocking the insert can finish before it's read back;
+    // that just means another pass, as in `add_job`.
+    for _ in 0..3 {
+        let inserted: Option<i64> = sqlx::query_scalar(
+            "INSERT INTO jobs (batch_id, input, url, video_key, stage) VALUES ($1, $2, $3, $2, 'clean')
+             ON CONFLICT (video_key) WHERE status IN ('queued', 'running', 'waiting', 'failed') DO NOTHING
+             RETURNING id",
+        )
+        .bind(batch_id)
+        .bind(video_key)
+        .bind(&url)
+        .fetch_optional(pool)
+        .await?;
+        if let Some(id) = inserted {
+            return Ok(Added::New(id));
+        }
+        let open: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM jobs WHERE video_key = $1
+             AND status IN ('queued', 'running', 'waiting', 'failed')",
+        )
+        .bind(video_key)
+        .fetch_optional(pool)
+        .await?;
+        if let Some(id) = open {
+            return Ok(Added::AlreadyOpen(id));
         }
     }
+    Err(Error::State(format!(
+        "{video_key} kept changing state while being queued; try again"
+    )))
 }
 
 pub async fn get_job(pool: &PgPool, id: i64) -> Result<Option<Job>> {

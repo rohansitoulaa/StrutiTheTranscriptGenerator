@@ -24,7 +24,7 @@ use crate::cleanup::{self, CleanupSettings};
 use crate::db::{self, Added, Job, Stage, Status};
 use crate::error::fs_err;
 use crate::folders::{self, FolderTree, Placement};
-use crate::llm::Llm;
+use crate::llm::{ChatReply, Llm, LlmError};
 use crate::metadata::VideoMeta;
 use crate::output::{
     find_notes_by_id, note_title, render_note, sha256_hex, update_note, write_note,
@@ -434,8 +434,22 @@ where
     async fn record_wait(&self, id: i64, fallback_stage: Stage, reason: &str, retry_in: Duration) {
         match db::wait(&self.db, id, reason, retry_in).await {
             Ok(true) => {}
-            Ok(false) => return,
-            Err(e) => tracing::error!(job = id, error = %e, "could not park the job"),
+            Ok(false) => {
+                tracing::info!(job = id, %reason, "LLM error after the job was stopped elsewhere");
+                return;
+            }
+            Err(e) => {
+                // It stays `running` until the next start; don't announce
+                // a wait that was never recorded.
+                tracing::error!(job = id, error = %e, "could not park the job");
+                self.emit(
+                    id,
+                    fallback_stage,
+                    Status::Failed,
+                    Some(format!("{reason} (could not be parked: {e})")),
+                );
+                return;
+            }
         }
         let stage = db::get_job(&self.db, id)
             .await
@@ -542,10 +556,7 @@ where
     /// Fluff removal and translation (PDA §4.3). Every run is stored.
     async fn stage_clean(&self, job: &Job) -> Result<Stage> {
         let transcript = self.transcript(job).await?;
-        let cleaned = {
-            let _slot = self.llm_slots.acquire().await.map_err(stopped)?;
-            cleanup::clean(&self.llm, &transcript, &self.cleanup).await?
-        };
+        let cleaned = cleanup::clean(&self.gated_llm(), &transcript, &self.cleanup).await?;
         db::insert_cleaning(&self.db, &job.video_key, &cleaned).await?;
         Ok(Stage::File)
     }
@@ -553,21 +564,28 @@ where
     /// Picks the note's folder (PDA §4.6). A video that already has a note
     /// (a re-clean) keeps it where it is, even if it was moved (FO-9).
     async fn stage_file(&self, job: &Job, folder: &mut Option<String>) -> Result<Stage> {
-        if folder.is_some() || !db::notes_for(&self.db, &job.video_key).await?.is_empty() {
+        if folder.is_some() {
+            return Ok(Stage::Write);
+        }
+        if !db::notes_for(&self.db, &job.video_key).await?.is_empty() {
+            // Record where the note is now, so the job shows its folder.
+            if let Some(current) = self.existing_note_folder(job).await? {
+                db::set_folder(&self.db, job.id, &current).await?;
+                *folder = Some(current);
+            }
             return Ok(Stage::Write);
         }
         let meta = self.video(job).await?;
         let transcript = self.transcript(job).await?;
         let cleaned = self.cleaning(job).await?;
-        let tree = FolderTree::scan(&self.out_dir)?;
+        let tree = self.in_vault(FolderTree::scan).await?;
         let title = note_title(&meta, &transcript, Some(&cleaned));
-        let placement = {
-            let _slot = self.llm_slots.acquire().await.map_err(stopped)?;
-            folders::sort(&self.llm, &tree, &title, &cleaned.text).await?
-        };
+        let placement = folders::sort(&self.gated_llm(), &tree, &title, &cleaned.text).await?;
         // Create it now, with the sorter's description (FO-6): only the
         // path is stored on the job, and the next note may need it.
-        folders::place(&self.out_dir, &placement)?;
+        let to_place = placement.clone();
+        self.in_vault(move |root| folders::place(root, &to_place))
+            .await?;
         let chosen = placement.relative_path();
         db::set_folder(&self.db, job.id, &chosen).await?;
         *folder = Some(chosen);
@@ -617,7 +635,7 @@ where
         let mut moved_from = None;
         if paths.is_empty() {
             // Moved in Obsidian: find it by the id in its frontmatter.
-            paths = find_notes_by_id(&self.out_dir, &job.video_key)?;
+            paths = self.find_notes(job).await?;
             moved_from = records.first().map(|r| r.path.clone());
         }
         let sha = sha256_hex(body);
@@ -625,14 +643,18 @@ where
         for path in paths {
             if update_note(&path, &hashes, body).await? {
                 let shown = path.display().to_string();
-                db::record_note(
+                let recorded = db::record_note(
                     &self.db,
                     &job.video_key,
                     &shown,
                     &sha,
                     moved_from.as_deref(),
                 )
-                .await?;
+                .await;
+                if let Err(e) = recorded {
+                    unrecorded_note(job, &shown, &e);
+                    return Err(e);
+                }
                 first.get_or_insert(path);
             }
         }
@@ -649,14 +671,26 @@ where
     ) -> Result<PathBuf> {
         let dir = match folder {
             Some(f) => {
-                let placement = folders::from_relative_path(&FolderTree::scan(&self.out_dir)?, f)?;
-                folders::place(&self.out_dir, &placement)?
+                let f = f.to_string();
+                self.in_vault(move |root| {
+                    let placement = folders::from_relative_path(&FolderTree::scan(root)?, &f)?;
+                    folders::place(root, &placement)
+                })
+                .await?
             }
             // A re-clean whose earlier note was edited: the new copy goes
             // next to it (OUT-6), else to the inbox.
             None => match self.existing_note_dir(job).await? {
                 Some(dir) => dir,
-                None => folders::place(&self.out_dir, &Placement::Inbox)?,
+                None => {
+                    tracing::warn!(
+                        job = job.id,
+                        key = %job.video_key,
+                        "re-clean found no earlier note anywhere; filing to Inbox"
+                    );
+                    self.in_vault(|root| folders::place(root, &Placement::Inbox))
+                        .await?
+                }
             },
         };
         let path = write_note(&dir, meta, transcript, Some(cleaned), &(self.today)()).await?;
@@ -666,15 +700,64 @@ where
             .await
             .map_err(fs_err("read", &path))?;
         let shown = path.display().to_string();
-        db::record_note(
+        let recorded = db::record_note(
             &self.db,
             &job.video_key,
             &shown,
             &sha256_hex(&written),
             None,
         )
-        .await?;
+        .await;
+        if let Err(e) = recorded {
+            unrecorded_note(job, &shown, &e);
+            return Err(e);
+        }
         Ok(path)
+    }
+
+    /// `Area/Topic` (or `Inbox`) of this video's current note, if it sits
+    /// at a depth Shruti files to.
+    async fn existing_note_folder(&self, job: &Job) -> Result<Option<String>> {
+        let Some(dir) = self.existing_note_dir(job).await? else {
+            return Ok(None);
+        };
+        let Ok(relative) = dir.strip_prefix(&self.out_dir) else {
+            return Ok(None);
+        };
+        let parts: Option<Vec<&str>> = relative
+            .components()
+            .map(|c| c.as_os_str().to_str())
+            .collect();
+        Ok(parts
+            .filter(|p| p.len() == 2 || p.as_slice() == [folders::INBOX])
+            .map(|p| p.join("/")))
+    }
+
+    async fn find_notes(&self, job: &Job) -> Result<Vec<PathBuf>> {
+        let key = job.video_key.clone();
+        self.in_vault(move |root| find_notes_by_id(root, &key))
+            .await
+    }
+
+    /// Runs a filesystem walk of the vault off the async workers: a large
+    /// vault would otherwise stall every other job.
+    async fn in_vault<R, W>(&self, f: W) -> Result<R>
+    where
+        R: Send + 'static,
+        W: FnOnce(&Path) -> Result<R> + Send + 'static,
+    {
+        let root = self.out_dir.clone();
+        tokio::task::spawn_blocking(move || f(&root))
+            .await
+            .map_err(|e| Error::State(format!("a vault task failed: {e}")))?
+    }
+
+    /// The LLM behind the queue's request slots.
+    fn gated_llm(&self) -> Gated<'_, L> {
+        Gated {
+            llm: &self.llm,
+            slots: &self.llm_slots,
+        }
     }
 
     /// The folder of this video's current note, wherever it was moved.
@@ -686,9 +769,7 @@ where
             .find(|p| p.is_file());
         let path = match recorded {
             Some(p) => Some(p),
-            None => find_notes_by_id(&self.out_dir, &job.video_key)?
-                .into_iter()
-                .next(),
+            None => self.find_notes(job).await?.into_iter().next(),
         };
         Ok(path.and_then(|p| p.parent().map(Path::to_path_buf)))
     }
@@ -736,6 +817,36 @@ where
             .await?
             .is_some())
     }
+}
+
+/// Takes an LLM slot per request, not per job: a long transcript's chunks
+/// then interleave with other jobs instead of holding the model throughout.
+struct Gated<'a, L> {
+    llm: &'a L,
+    slots: &'a Semaphore,
+}
+
+impl<L: Llm + Sync> Llm for Gated<'_, L> {
+    async fn chat(&self, system: &str, user: &str) -> std::result::Result<ChatReply, LlmError> {
+        // Never closed while the queue exists (see `stopped`).
+        let _slot = self.slots.acquire().await;
+        self.llm.chat(system, user).await
+    }
+
+    fn label(&self) -> String {
+        self.llm.label()
+    }
+}
+
+/// A note on disk that the database doesn't know about looks "edited" to
+/// the next re-clean, which then writes a copy beside it instead.
+fn unrecorded_note(job: &Job, path: &str, e: &Error) {
+    tracing::error!(
+        job = job.id,
+        path,
+        error = %e,
+        "note written but not recorded; a re-clean will treat it as edited"
+    );
 }
 
 /// The semaphores are never closed while a queue exists, so this only

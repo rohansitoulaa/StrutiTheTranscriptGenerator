@@ -82,13 +82,23 @@ pub async fn clean<L: Llm>(
 
     let mut parts = Vec::with_capacity(chunks.len());
     let (mut tokens_in, mut tokens_out) = (0u64, 0u64);
+    let mut dropped = 0;
     for (i, text) in chunks.iter().enumerate() {
         let user = user_message(text, i, chunks.len(), language);
         let reply = llm.chat(&settings.prompt, &user).await?;
         tokens_in += u64::from(reply.tokens_in.unwrap_or(0));
         tokens_out += u64::from(reply.tokens_out.unwrap_or(0));
         let part = tidy(&reply.text);
-        if !part.is_empty() {
+        if part.is_empty() {
+            // One lost chunk barely moves the overall word ratio, so it
+            // gets flagged on its own.
+            tracing::warn!(
+                chunk = i + 1,
+                of = chunks.len(),
+                "a cleaned chunk came back empty"
+            );
+            dropped += 1;
+        } else {
             parts.push(part);
         }
     }
@@ -106,7 +116,7 @@ pub async fn clean<L: Llm>(
     } else {
         clean_words as f32 / raw_words as f32
     };
-    let review = text.is_empty() || ratio < settings.min_ratio || ratio > max;
+    let review = text.is_empty() || dropped > 0 || ratio < settings.min_ratio || ratio > max;
     if review {
         tracing::warn!(ratio, raw_words, clean_words, "cleanup flagged for review");
     }
@@ -272,9 +282,11 @@ fn is_lead_in(line: &str) -> bool {
     opener && (l.ends_with(':') || l.contains("cleaned") || l.contains("translat") || l.len() < 12)
 }
 
+/// Only lines that are clearly the model talking to the reader: a real
+/// closing sentence like "Feel free to experiment with the settings." stays.
 fn is_sign_off(line: &str) -> bool {
     let l = line.trim().to_ascii_lowercase();
-    [
+    let opener = [
         "let me know",
         "i hope this",
         "hope this helps",
@@ -282,7 +294,18 @@ fn is_sign_off(line: &str) -> bool {
         "feel free to",
     ]
     .iter()
-    .any(|p| l.starts_with(p))
+    .any(|p| l.starts_with(p));
+    let about_the_answer = [
+        "help",
+        "anything else",
+        "question",
+        "assist",
+        "further",
+        "adjust",
+    ]
+    .iter()
+    .any(|w| l.contains(w));
+    opener && about_the_answer
 }
 
 #[cfg(test)]
@@ -464,6 +487,85 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, LlmError::QuotaExhausted);
+    }
+
+    #[tokio::test]
+    async fn every_chunk_of_a_long_hindi_transcript_is_told_to_translate() {
+        let paragraph = "यह वाक्य विषय के बारे में असली जानकारी देता है। ".repeat(15);
+        let t = transcript("hi", &[&paragraph, &paragraph, &paragraph]);
+        let settings = CleanupSettings {
+            chunk_tokens: estimate_tokens(&paragraph) + 5,
+            ..CleanupSettings::default()
+        };
+        let llm = FakeLlm::new(vec![Ok("One."), Ok("Two."), Ok("Three.")]);
+        clean(&llm, &t, &settings).await.unwrap();
+        let seen = llm.seen();
+        assert_eq!(seen.len(), 3);
+        for message in seen {
+            assert!(
+                message.contains("Translate it into natural English."),
+                "{message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn guardrail_boundaries_are_inclusive() {
+        // 100 raw words: exactly 25 and exactly 110 cleaned words pass;
+        // 24 and 111 are flagged.
+        let raw = "word ".repeat(100);
+        for (words, review) in [(25, false), (24, true), (110, false), (111, true)] {
+            let reply = "kept ".repeat(words);
+            let llm = FakeLlm::new(vec![Ok(reply.as_str())]);
+            let out = clean(
+                &llm,
+                &transcript("en", &[&raw]),
+                &CleanupSettings::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(out.review, review, "{words} words");
+        }
+        // Translations get up to 1.6×.
+        let llm = FakeLlm::new(vec![Ok("kept ".repeat(160).as_str())]);
+        let out = clean(
+            &llm,
+            &transcript("hi", &[&raw]),
+            &CleanupSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert!(!out.review);
+    }
+
+    #[tokio::test]
+    async fn a_chunk_that_comes_back_empty_flags_the_note() {
+        let paragraph = "This sentence carries real information about the topic. ".repeat(20);
+        let t = transcript("en", &[&paragraph, &paragraph, &paragraph]);
+        let settings = CleanupSettings {
+            chunk_tokens: estimate_tokens(&paragraph) + 5,
+            ..CleanupSettings::default()
+        };
+        let full = paragraph.trim().to_string();
+        let llm = FakeLlm::new(vec![
+            Ok(full.as_str()),
+            Ok("Here is the cleaned transcript:"),
+            Ok(full.as_str()),
+        ]);
+        let out = clean(&llm, &t, &settings).await.unwrap();
+        assert!(out.review, "a whole chunk vanished");
+    }
+
+    #[test]
+    fn tidy_keeps_real_closing_sentences() {
+        assert_eq!(
+            tidy("Set the gain first.\n\nFeel free to experiment with the settings."),
+            "Set the gain first.\n\nFeel free to experiment with the settings."
+        );
+        assert_eq!(
+            tidy("Set the gain first.\n\nFeel free to ask if you have any questions!"),
+            "Set the gain first."
+        );
     }
 
     #[test]
