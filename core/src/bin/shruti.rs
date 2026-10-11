@@ -274,7 +274,13 @@ async fn reclean_batch(queue: &CliQueue, links: &[String]) -> Result<(HashSet<i6
     let mut ids = HashSet::new();
     for (key, added) in queue.reclean(&keys).await.map_err(|e| e.to_string())? {
         match added {
-            Ok(Added::New(id) | Added::AlreadyOpen(id) | Added::Retried(id)) => {
+            Ok(Added::New(id) | Added::Retried(id)) => {
+                ids.insert(id);
+            }
+            Ok(Added::AlreadyOpen(id)) => {
+                // Asked for now: a waiting or failed job runs again at once
+                // (otherwise a waiting one would count as settled already).
+                queue.retry(id).await.map_err(|e| e.to_string())?;
                 ids.insert(id);
             }
             Ok(Added::AlreadyDone { .. }) => {}
