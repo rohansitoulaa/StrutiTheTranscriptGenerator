@@ -269,6 +269,15 @@ cost is speed: a one-word round trip takes ~25 s, and cleaning an 83 s reel
 takes several minutes. A cloud provider (Gemini, OpenAI) is the fast path
 for big batches.
 
+**Gemma 4 is a reasoning model; Shruti turns the reasoning off.** By default
+it spends its token budget on hidden "thinking" (`reasoning_content`) and
+can return an empty answer; a first live re-clean timed out after 15 min.
+Requests to LM Studio send `"reasoning_effort": "none"` (measured: 0
+reasoning tokens, a 19 s round trip instead of 65 s). `low`,
+`chat_template_kwargs` and `reasoning.effort` had no effect. Cloud providers
+never get the flag. Measured on CPU: ~1.7 tokens/s generated, ~60–80
+tokens/s prompt processing; an 83 s reel (365 words) cleans in ~4 min.
+
 **Vulkan device 0 is the Intel Arc iGPU, and whisper.cpp picks it by
 default.** The core probes the device list once at startup and passes
 `-dev` with the first discrete (`uma: 0`) GPU. Measured on a 19 s clip:
@@ -318,9 +327,22 @@ Models live in `models/` (gitignored): `ggml-large-v3-turbo-q5_0.bin` and
 - Extractor behaviour here changes constantly, so treat any specific finding as
   something to re-verify rather than a fixed fact.
 - **As of yt-dlp 2026.08.19, `instagram:user` is marked "CURRENTLY BROKEN"**,
-  so whole-profile expansion (PDA IG-1) can't rely on yt-dlp. Step 3 needs
-  another way to list a profile's reels. Single reels still go through yt-dlp,
-  and need cookies even for public ones.
+  so whole-profile expansion (PDA IG-1) can't rely on yt-dlp. Single reels
+  still go through yt-dlp, and need cookies even for public ones.
+- **Measured 2026-10-12, with exported cookies (logged in):**
+  - `GET /api/v1/media/{id}/info/` works (yt-dlp and plain curl, no TLS
+    impersonation needed). Single reels are fine.
+  - The profile page HTML loads logged in and carries `"profile_id"`.
+  - The REST listing endpoints are closed to the web app:
+    `users/web_profile_info` answers 429, and `feed/user/{id}/`,
+    `feed/user/{name}/username/` and `POST clips/user/` redirect to `/`.
+  - The web app itself lists a profile through private GraphQL queries
+    (`/graphql/query`, `doc_id` from its JS bundles). Building on that was
+    not pursued: it is reverse-engineering a private API, and is left as an
+    open decision.
+- **Cookie export:** yt-dlp `--cookies-from-browser brave --cookies FILE`
+  dumps every browser cookie, so Shruti keeps only the `instagram.com`
+  lines, in `~/.local/share/shruti/instagram-cookies.txt` (0600).
 
 ---
 
@@ -428,7 +450,9 @@ doesn't.
 2. ✅ **Postgres + the worker pool.** Resumability and the
    download/transcribe/cleanup overlap. (Done 2026-10-11: `db.rs`,
    `queue.rs`, migration `0001_init.sql`.)
-2b. **LLM cleanup stage.** Prompt, chunking, length guardrail, re-clean.
+2b. ✅ **LLM cleanup stage.** Prompt, chunking, length guardrail, re-clean,
+   folder auto-sort. (Done 2026-10-12: `llm.rs`, `cleanup.rs`, `folders.rs`,
+   `secrets.rs`, migration `0003_cleanup.sql`.)
 3. **Channel and profile expansion.** The part most likely to be fiddly.
 4. **UI over the working core.** Queue table, live progress, transcript viewer.
 5. **Settings, notifications, the yt-dlp version check.**

@@ -380,11 +380,11 @@ anything.
 | Cloud providers rename or retire models. | The saved model stops working. | Model list comes from the provider (LLM-3). An unknown model shows up as a clear `waiting for LLM` reason, and the Test button confirms the fix. |
 | Transcripts sent to a cloud provider. | Privacy. Free tiers may train on inputs. | Local is the default and cloud is opt-in. Only text is sent, never audio (LLM-9). |
 | The LLM cuts real content or invents some. | Wrong or missing information in notes. | Strict deletion-only prompt (CL-4), length guardrail (CL-6), raw text always kept (DB-5), raw/cleaned side-by-side view (UI-4). |
-| LM Studio and Whisper both want the 4060. | Out-of-memory errors or slow Whisper. | Cap LM Studio's GPU offload so Whisper keeps headroom. To verify in build step 1. |
+| LM Studio and Whisper both want the 4060. | Out-of-memory errors or slow Whisper. | **Resolved in step 2b:** LM Studio's GPU offload crashes under the NVK driver anyway, so Gemma runs CPU-only (`--gpu off`, ~18.5 GB RAM) and the 4060 is Whisper's alone. The cost is ~1.7 tokens/s, so a cloud provider is the fast path for big batches. |
 | yt-dlp breaks when YouTube or Instagram change. | Every job fails. | Update button (YT-3) plus failure-pattern hint (YT-4). |
 | Instagram flags or blocks the account. | Profiles stop working. | Cookies from a secondary account, low concurrency, delays, auto-pause on rate limits (IG-3 to IG-5). |
 | Hindi auto-captions on YouTube are poor quality. | Bad source text feeds the translation. | **Resolved in step 1:** on a real Hindi video, YouTube's `hi-orig` captions were accurate and punctuated, while Whisper dropped phrases and misspelled words. Hindi YouTube uses captions. Whisper remains the fallback. |
-| yt-dlp's Instagram profile extractor is broken (`instagram:user`, "CURRENTLY BROKEN" as of 2026.08.19). | IG-1 whole profiles can't be listed through yt-dlp. | **Open, for step 3:** find another way to list a profile's reels. Single reels work through yt-dlp with cookies. |
+| yt-dlp's Instagram profile extractor is broken (`instagram:user`, "CURRENTLY BROKEN" as of 2026.08.19). | IG-1 whole profiles can't be listed through yt-dlp. | **Open:** Instagram has also closed its REST listing endpoints to the web app (measured 2026-10-12); only its private GraphQL queries still list a profile. Single reels work through yt-dlp with cookies. Profile links go through yt-dlp's extractor, so they start working when an update fixes it. |
 | Scraping Instagram is against its terms. | Account risk only, since this is a personal tool. | Personal use, public content, never distributed. |
 
 ---
