@@ -1,0 +1,6 @@
+/target
+/vendor/
+/models/
+*.wav
+.env
+/out/
