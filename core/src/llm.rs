@@ -405,7 +405,10 @@ fn classify(status: u16, body: &str, retry_after: Option<Duration>) -> LlmError 
     let lower = body.to_ascii_lowercase();
     let short: String = body.chars().take(MAX_ERROR_BODY).collect();
     let model_missing =
-        lower.contains("model") && (lower.contains("not found") || lower.contains("not loaded"));
+        // LM Studio also answers a request in flight when its model is
+        // unloaded (TTL, or by hand) with "Model unloaded by user…".
+        lower.contains("model")
+            && ["not found", "not loaded", "unloaded"].iter().any(|s| lower.contains(s));
     match status {
         401 | 403 => LlmError::InvalidKey,
         // OpenAI says "insufficient_quota", Gemini "RESOURCE_EXHAUSTED" with
@@ -550,6 +553,15 @@ mod tests {
         ));
         assert!(matches!(
             error_for(400, r#"{"error":"Model gemma is not loaded"}"#, None).await,
+            LlmError::ModelNotFound(_)
+        ));
+        assert!(matches!(
+            error_for(
+                400,
+                r#"{"error":"Model unloaded by user or API request."}"#,
+                None
+            )
+            .await,
             LlmError::ModelNotFound(_)
         ));
         assert!(matches!(
