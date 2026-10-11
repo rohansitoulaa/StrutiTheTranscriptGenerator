@@ -1,0 +1,79 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #ffffff;
+  --panel: #f7f7f8;
+  --hover: #efeff1;
+  --line: #e3e3e6;
+  --fg: #1b1b1f;
+  --muted: #6e6e78;
+  --accent: #2563eb;
+  --ok: #16a34a;
+  --warn: #c2770c;
+  --bad: #dc2626;
+  --idle: #9d9da6;
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #18181b;
+    --panel: #1e1e22;
+    --hover: #28282d;
+    --line: #2f2f35;
+    --fg: #e6e6ea;
+    --muted: #9a9aa4;
+    --accent: #6ea0ff;
+    --ok: #4ade80;
+    --warn: #f0b04a;
+    --bad: #f87171;
+    --idle: #6e6e78;
+    color-scheme: dark;
+  }
+}
+
+@theme inline {
+  --font-sans: "Inter Variable", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+  --color-bg: var(--bg);
+  --color-panel: var(--panel);
+  --color-hover: var(--hover);
+  --color-line: var(--line);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-accent: var(--accent);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-bad: var(--bad);
+  --color-idle: var(--idle);
+}
+
+/* Desktop density (PDA UI-6): 13px base. */
+html {
+  font-size: 13px;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+}
