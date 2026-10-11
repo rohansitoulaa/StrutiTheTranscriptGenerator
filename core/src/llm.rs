@@ -169,15 +169,23 @@ pub struct LlmClient {
     provider: Provider,
 }
 
-/// A local 31B model on CPU can take minutes for one long chunk.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Cloud providers answer in seconds; this only catches a hung connection.
+const CLOUD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// A local 31B model on CPU runs at ~1.7 tokens/s, and slower while the
+/// machine is busy: one Hindi chunk measured over 15 min. A stopped LM
+/// Studio still fails fast on the connect timeout.
+const LOCAL_TIMEOUT: Duration = Duration::from_secs(90 * 60);
 const MAX_ERROR_BODY: usize = 500;
 
 impl LlmClient {
     pub fn new(provider: Provider) -> std::result::Result<Self, LlmError> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(if provider.kind.is_local() {
+                LOCAL_TIMEOUT
+            } else {
+                CLOUD_TIMEOUT
+            })
             .build()
             .map_err(|e| LlmError::BadResponse(format!("could not build the HTTP client: {e}")))?;
         Ok(LlmClient { http, provider })
