@@ -53,6 +53,9 @@ pub struct AppState {
     /// Model download progress while it lasts.
     download: Mutex<Option<String>>,
     exiting: AtomicBool,
+    /// One start, restart or stop at a time: a save during first launch
+    /// must not leave two cores (and two dispatchers) running.
+    lifecycle: tokio::sync::Mutex<()>,
     pub http: reqwest::Client,
 }
 
@@ -153,12 +156,18 @@ pub fn config_for(settings: &Settings, paths: &Paths) -> Result<Config, String> 
 }
 
 pub fn start(app: AppHandle) {
-    tauri::async_runtime::spawn(async move { start_core(&app).await });
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let _turn = state.lifecycle.lock().await;
+        start_core(&app).await;
+    });
 }
 
 /// Applies saved settings: the queue stops (jobs in flight resume where
 /// they were) and starts again with the new configuration.
 pub async fn restart(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let _turn = state.lifecycle.lock().await;
     stop_core(app).await;
     start_core(app).await;
 }
@@ -209,6 +218,8 @@ pub fn exit_requested(app: &AppHandle, api: &tauri::ExitRequestApi) {
     api.prevent_exit();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let _turn = state.lifecycle.lock().await;
         stop_core(&app).await;
         app.exit(0);
     });
@@ -306,7 +317,13 @@ fn forward_events(app: &AppHandle, core: &Arc<Core>) {
     tauri::async_runtime::spawn(async move {
         let mut busy_since = None;
         loop {
-            match events.recv().await {
+            // Ends with its core; otherwise every restart would leave one
+            // behind, holding the old queue.
+            let event = tokio::select! {
+                _ = core.shutdown.cancelled() => break,
+                event = events.recv() => event,
+            };
+            match event {
                 Ok(e) => {
                     let _ = app.emit("job", &e);
                     match e.status {

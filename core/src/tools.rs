@@ -1,7 +1,7 @@
 //! What Shruti keeps up to date itself: its own copy of yt-dlp (PDA YT-2,
 //! YT-3) and the Whisper models (UI-7).
 //!
-//! Downloads go to `<name>.part` and are renamed into place only once
+//! Downloads go to a hidden `.part` file and are renamed into place only once
 //! complete (and, for yt-dlp, checksum-verified and runnable), so an
 //! interrupted download never replaces a working file.
 
@@ -180,10 +180,15 @@ async fn download(
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(fs_err("create", dir))?;
-    let part = dest.with_extension(match dest.extension() {
-        Some(ext) => format!("{}.part", ext.to_string_lossy()),
-        None => "part".into(),
-    });
+    // Unique per attempt: two downloads to the same destination (Update
+    // clicked twice) must never write into one file.
+    static ATTEMPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let attempt = ATTEMPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let part = dir.join(format!(".{name}.{}-{attempt}.part", std::process::id()));
     let result = async {
         let mut response = get(http, url).await?;
         let total = response.content_length();
@@ -253,6 +258,16 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn no_partials(dir: &Path) -> bool {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .all(|e| !e.file_name().to_string_lossy().ends_with(".part"))
+            })
+            .unwrap_or(true)
+    }
     use pretty_assertions::assert_eq;
     use std::sync::Mutex;
     use wiremock::matchers::{method, path};
@@ -326,7 +341,7 @@ mod tests {
         assert_eq!(version, "2026.10.01");
         let bin = managed_ytdlp(data.path());
         assert_eq!(ytdlp_version(&bin).await.unwrap(), "2026.10.01");
-        assert!(!bin.with_extension("part").exists());
+        assert!(no_partials(bin.parent().unwrap()));
     }
 
     #[tokio::test]
@@ -344,7 +359,7 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"), "{err}");
         assert_eq!(std::fs::read_to_string(&bin).unwrap(), "old");
-        assert!(!bin.with_extension("part").exists());
+        assert!(no_partials(bin.parent().unwrap()));
     }
 
     #[tokio::test]
@@ -407,7 +422,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Download { .. }), "{err:?}");
-        assert!(!model.exists() && !dir.path().join("m.bin.part").exists());
+        assert!(!model.exists() && no_partials(dir.path()));
     }
 
     #[tokio::test]
@@ -429,6 +444,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"), "{err}");
-        assert!(!model.exists() && !dir.path().join("m.bin.part").exists());
+        assert!(!model.exists() && no_partials(dir.path()));
     }
 }
