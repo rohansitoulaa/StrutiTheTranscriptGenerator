@@ -259,11 +259,19 @@ async fn build(app: &AppHandle) -> Result<Core, String> {
 /// Downloads the Whisper (and VAD) model if missing, showing progress
 /// (UI-7). In a repo checkout they're already in `models/`.
 async fn fetch_models(app: &AppHandle, config: &Config) -> Result<(), String> {
-    let mut models = vec![(tools::WHISPER_MODEL_URL, config.whisper_model.as_path())];
+    let mut models = vec![tools::ModelFile {
+        url: tools::WHISPER_MODEL_URL,
+        sha256: tools::WHISPER_MODEL_SHA256,
+        path: &config.whisper_model,
+    }];
     if let Some(vad) = &config.vad_model {
-        models.push((tools::VAD_MODEL_URL, vad.as_path()));
+        models.push(tools::ModelFile {
+            url: tools::VAD_MODEL_URL,
+            sha256: tools::VAD_MODEL_SHA256,
+            path: vad,
+        });
     }
-    if models.iter().all(|(_, path)| path.is_file()) {
+    if models.iter().all(|m| m.path.is_file()) {
         return Ok(());
     }
     let state = app.state::<AppState>();

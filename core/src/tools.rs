@@ -25,6 +25,20 @@ pub const WHISPER_MODEL_URL: &str =
     "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin";
 pub const VAD_MODEL_URL: &str =
     "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
+/// The models as downloaded and tested in build step 1. The URLs follow a
+/// moving branch, so a changed or tampered file fails here instead of
+/// reaching Whisper.
+pub const WHISPER_MODEL_SHA256: &str =
+    "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2";
+pub const VAD_MODEL_SHA256: &str =
+    "29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf";
+
+/// A model to fetch if it's missing.
+pub struct ModelFile<'a> {
+    pub url: &'a str,
+    pub sha256: &'a str,
+    pub path: &'a Path,
+}
 
 /// Shruti's own yt-dlp, preferred over the bundled one once it exists.
 pub fn managed_ytdlp(data_dir: &Path) -> PathBuf {
@@ -130,18 +144,19 @@ pub async fn install_ytdlp(
     }
 }
 
-/// Fetches whichever of the Whisper and VAD models are missing (UI-7).
-/// `progress(file, done, total)` reports bytes as they arrive.
+/// Fetches whichever of the Whisper and VAD models are missing (UI-7),
+/// checking each against its SHA-256. `progress(file, done, total)` reports
+/// bytes as they arrive.
 pub async fn ensure_models(
     http: &reqwest::Client,
-    models: &[(&str, &Path)],
+    models: &[ModelFile<'_>],
     progress: impl Fn(&Path, u64, Option<u64>),
 ) -> Result<()> {
-    for (url, path) in models {
+    for ModelFile { url, sha256, path } in models {
         if path.is_file() {
             continue;
         }
-        let part = download(http, url, path, None, |done, total| {
+        let part = download(http, url, path, Some(sha256), |done, total| {
             progress(path, done, total)
         })
         .await?;
@@ -350,9 +365,21 @@ mod tests {
         let seen = Mutex::new(Vec::new());
         let whisper_url = format!("{}/whisper.bin", server.uri());
         let vad_url = format!("{}/never-fetched.bin", server.uri());
+        let good = sha(&[7u8; 4096]);
         ensure_models(
             &reqwest::Client::new(),
-            &[(&whisper_url, &whisper), (&vad_url, &vad)],
+            &[
+                ModelFile {
+                    url: &whisper_url,
+                    sha256: &good,
+                    path: &whisper,
+                },
+                ModelFile {
+                    url: &vad_url,
+                    sha256: &good,
+                    path: &vad,
+                },
+            ],
             |_, done, total| seen.lock().unwrap().push((done, total)),
         )
         .await
@@ -371,10 +398,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let model = dir.path().join("m.bin");
         let url = format!("{}/m.bin", server.uri());
-        let err = ensure_models(&reqwest::Client::new(), &[(&url, &model)], |_, _, _| {})
+        let file = ModelFile {
+            url: &url,
+            sha256: "00",
+            path: &model,
+        };
+        let err = ensure_models(&reqwest::Client::new(), &[file], |_, _, _| {})
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Download { .. }), "{err:?}");
+        assert!(!model.exists() && !dir.path().join("m.bin.part").exists());
+    }
+
+    #[tokio::test]
+    async fn a_model_with_the_wrong_checksum_is_never_put_in_place() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![1u8; 64]))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("m.bin");
+        let url = format!("{}/m.bin", server.uri());
+        let file = ModelFile {
+            url: &url,
+            sha256: WHISPER_MODEL_SHA256,
+            path: &model,
+        };
+        let err = ensure_models(&reqwest::Client::new(), &[file], |_, _, _| {})
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("checksum mismatch"), "{err}");
         assert!(!model.exists() && !dir.path().join("m.bin.part").exists());
     }
 }
