@@ -45,6 +45,9 @@ pub enum Error {
     #[error("Instagram is limiting requests, so Instagram jobs are paused: {0}")]
     InstagramBlocked(String),
 
+    #[error("could not download {url}: {reason}")]
+    Download { url: String, reason: String },
+
     #[error("no transcript produced: {0}")]
     Empty(String),
 

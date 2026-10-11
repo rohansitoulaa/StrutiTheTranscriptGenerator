@@ -798,7 +798,7 @@ where
         if !db::notes_for(&self.db, &job.video_key).await?.is_empty() {
             // Record where the note is now, so the job shows its folder.
             if let Some(current) = self.existing_note_folder(job).await? {
-                db::set_folder(&self.db, job.id, &current).await?;
+                db::set_folder(&self.db, job.id, &current, false).await?;
                 *folder = Some(current);
             }
             return Ok(Stage::Write);
@@ -815,7 +815,8 @@ where
         self.in_vault(move |root| folders::place(root, &to_place))
             .await?;
         let chosen = placement.relative_path();
-        db::set_folder(&self.db, job.id, &chosen).await?;
+        let created = matches!(placement, Placement::New(_));
+        db::set_folder(&self.db, job.id, &chosen, created).await?;
         *folder = Some(chosen);
         Ok(Stage::Write)
     }

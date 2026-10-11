@@ -138,13 +138,15 @@ pub struct Job {
     pub note_path: Option<String>,
     /// Where the file stage placed the note: `Area/Topic` or `Inbox`.
     pub folder: Option<String>,
+    /// The file stage created that folder for this note (FO-11).
+    pub folder_new: bool,
     /// From `videos`, once metadata has been fetched.
     pub title: Option<String>,
     pub channel: Option<String>,
 }
 
 const JOB_COLUMNS: &str = "j.id, j.batch_id, j.input, j.url, j.video_key, j.stage, j.status, j.reason, \
-     j.caption_error, j.attempts, j.review, j.note_path, j.folder, v.title, v.channel";
+     j.caption_error, j.attempts, j.review, j.note_path, j.folder, j.folder_new, v.title, v.channel";
 
 fn job_from_row(row: &PgRow) -> Result<Job> {
     Ok(Job {
@@ -161,6 +163,7 @@ fn job_from_row(row: &PgRow) -> Result<Job> {
         review: row.try_get("review")?,
         note_path: row.try_get("note_path")?,
         folder: row.try_get("folder")?,
+        folder_new: row.try_get("folder_new")?,
         title: row.try_get("title")?,
         channel: row.try_get("channel")?,
     })
@@ -421,12 +424,15 @@ pub async fn known_keys(
     Ok(known.into_iter().collect())
 }
 
-pub async fn set_folder(pool: &PgPool, id: i64, folder: &str) -> Result<bool> {
+/// `is_new`: the file stage created this folder (FO-11).
+pub async fn set_folder(pool: &PgPool, id: i64, folder: &str, is_new: bool) -> Result<bool> {
     let done = sqlx::query(
-        "UPDATE jobs SET folder = $2, updated_at = now() WHERE id = $1 AND status = 'running'",
+        "UPDATE jobs SET folder = $2, folder_new = $3, updated_at = now()
+         WHERE id = $1 AND status = 'running'",
     )
     .bind(id)
     .bind(folder)
+    .bind(is_new)
     .execute(pool)
     .await?;
     Ok(done.rows_affected() == 1)
@@ -1241,7 +1247,7 @@ mod tests {
             panic!()
         };
         claim_next(&pool).await.unwrap();
-        assert!(set_folder(&pool, id, "Design/UX").await.unwrap());
+        assert!(set_folder(&pool, id, "Design/UX", true).await.unwrap());
         assert_eq!(
             get_job(&pool, id).await.unwrap().unwrap().folder.as_deref(),
             Some("Design/UX")

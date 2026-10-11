@@ -1076,6 +1076,11 @@ async fn notes_are_cleaned_and_filed_into_a_sorted_folder(pool: PgPool) {
     );
     assert_eq!(count(&h.pool, "SELECT count(*) FROM cleanings").await, 2);
     assert_eq!(count(&h.pool, "SELECT count(*) FROM notes").await, 2);
+    assert_eq!(
+        jobs.iter().filter(|j| j.folder_new).count(),
+        1,
+        "only the first note created the folder; the second reused it"
+    );
 }
 
 #[sqlx::test]
@@ -1276,6 +1281,7 @@ async fn reclean_rewrites_an_unedited_note_in_place(pool: PgPool) {
     );
     assert!(note_of(&again).contains("Revised. spoken words."));
     assert_eq!(again.folder.as_deref(), Some("Testing/Fakes"));
+    assert!(!again.folder_new, "a re-clean creates no folder");
     assert_eq!(h.shared.count("whisper"), 1, "no re-transcription");
     assert_eq!(h.shared.count("llm sort"), sorts, "no re-filing");
     assert_eq!(count(&h.pool, "SELECT count(*) FROM cleanings").await, 2);
