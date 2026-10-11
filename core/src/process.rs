@@ -43,6 +43,7 @@ pub(crate) async fn run_tool(
             // forked child elsewhere still briefly holds it open.
             Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 5 => {
                 attempt += 1;
+                tracing::debug!(tool, attempt, "executable busy; retrying");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             other => break other.map_err(|source| Error::Spawn { tool, source })?,

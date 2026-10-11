@@ -253,8 +253,9 @@ pub async fn claim_next(pool: &PgPool) -> Result<Option<Job>> {
     .fetch_optional(pool)
     .await?;
     if claimed.is_none() {
+        // The wait's reason is stale once it runs again.
         claimed = sqlx::query_scalar(
-            "UPDATE jobs SET status = 'running', updated_at = now()
+            "UPDATE jobs SET status = 'running', reason = NULL, retry_at = NULL, updated_at = now()
              WHERE id = (SELECT id FROM jobs WHERE status = 'waiting' AND retry_at <= now()
                          ORDER BY retry_at, id FOR UPDATE SKIP LOCKED LIMIT 1)
              RETURNING id",
@@ -1010,6 +1011,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(runs, 2);
+    }
+
+    #[sqlx::test]
+    async fn queued_jobs_go_before_due_waiting_ones_which_go_by_due_time(pool: PgPool) {
+        let mut ids = Vec::new();
+        for key in ["youtube:a", "youtube:b", "youtube:c"] {
+            let Added::New(id) = add(&pool, key).await else {
+                panic!()
+            };
+            ids.push(id);
+        }
+        // a: due a minute ago, b: due two minutes ago, c: still queued.
+        for (id, ago) in [(ids[0], 60), (ids[1], 120)] {
+            sqlx::query(
+                "UPDATE jobs SET status = 'waiting', reason = 'x',
+                 retry_at = now() - make_interval(secs => $2) WHERE id = $1",
+            )
+            .bind(id)
+            .bind(f64::from(ago))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mut order = Vec::new();
+        while let Some(job) = claim_next(&pool).await.unwrap() {
+            assert_eq!(job.reason, None, "a resumed job's wait reason is cleared");
+            order.push(job.id);
+        }
+        assert_eq!(order, [ids[2], ids[1], ids[0]]);
     }
 
     #[sqlx::test]

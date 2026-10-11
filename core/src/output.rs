@@ -234,7 +234,8 @@ fn frontmatter_contains(path: &Path, needle: &str) -> bool {
         Ok(f) => f,
         Err(e) => {
             if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %path.display(), error = %e, "unreadable note skipped while looking for it by id");
+                // Every vault scan would repeat it; debug, not warn.
+                tracing::debug!(path = %path.display(), error = %e, "unreadable note skipped while looking for it by id");
             }
             return false;
         }

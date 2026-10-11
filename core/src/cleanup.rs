@@ -302,6 +302,12 @@ fn is_sign_off(line: &str) -> bool {
         "assist",
         "further",
         "adjust",
+        "thought",
+        "reach out",
+        "feedback",
+        "comment",
+        "need",
+        "want me",
     ]
     .iter()
     .any(|w| l.contains(w));
@@ -562,10 +568,19 @@ mod tests {
             tidy("Set the gain first.\n\nFeel free to experiment with the settings."),
             "Set the gain first.\n\nFeel free to experiment with the settings."
         );
-        assert_eq!(
-            tidy("Set the gain first.\n\nFeel free to ask if you have any questions!"),
-            "Set the gain first."
-        );
+        for sign_off in [
+            "Feel free to ask if you have any questions!",
+            "Let me know your thoughts.",
+            "Feel free to reach out.",
+            "Let me know if you need anything changed.",
+            "If you'd like, I can shorten it further.",
+        ] {
+            assert_eq!(
+                tidy(&format!("Set the gain first.\n\n{sign_off}")),
+                "Set the gain first.",
+                "{sign_off}"
+            );
+        }
     }
 
     #[test]

@@ -1064,6 +1064,67 @@ async fn an_unreachable_llm_parks_jobs_until_it_is_back(pool: PgPool) {
     assert_eq!(h.shared.count("whisper"), 1);
 }
 
+/// Records what it was asked and how many requests overlapped.
+#[derive(Default)]
+struct SlowLlm {
+    log: Mutex<Vec<String>>,
+    now: AtomicUsize,
+    max: AtomicUsize,
+}
+
+impl Llm for SlowLlm {
+    async fn chat(&self, _system: &str, user: &str) -> std::result::Result<ChatReply, LlmError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let n = self.now.fetch_add(1, SeqCst) + 1;
+        self.max.fetch_max(n, SeqCst);
+        self.log.lock().unwrap().push(user.to_string());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        self.now.fetch_sub(1, SeqCst);
+        if user.ends_with("fail") {
+            return Err(LlmError::BadResponse("x".into()));
+        }
+        Ok(ChatReply {
+            text: "ok".into(),
+            tokens_in: None,
+            tokens_out: None,
+        })
+    }
+
+    fn label(&self) -> String {
+        "slow".into()
+    }
+}
+
+#[tokio::test]
+async fn llm_slots_are_per_request_so_two_jobs_chunks_interleave() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let llm = SlowLlm::default();
+    let slots = Semaphore::new(1);
+    let gated = Gated {
+        llm: &llm,
+        slots: &slots,
+    };
+    let g = &gated;
+    let job = |name: &'static str| async move {
+        for i in 0..3 {
+            // A failed request must hand its slot on too.
+            let user = if (name, i) == ("a", 0) {
+                "a0 fail".to_string()
+            } else {
+                format!("{name}{i}")
+            };
+            let _ = g.chat("s", &user).await;
+        }
+    };
+    tokio::join!(job("a"), job("b"));
+    assert_eq!(llm.max.load(SeqCst), 1, "one request at a time");
+    assert_eq!(
+        *llm.log.lock().unwrap(),
+        ["a0 fail", "b0", "a1", "b1", "a2", "b2"]
+    );
+    assert_eq!(slots.available_permits(), 1);
+}
+
 #[sqlx::test]
 async fn a_waiting_job_resumes_by_itself_once_due(pool: PgPool) {
     let h = quick(pool);
@@ -1081,6 +1142,9 @@ async fn a_waiting_job_resumes_by_itself_once_due(pool: PgPool) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let job = db::get_job(&h.pool, id).await.unwrap().unwrap();
+        if job.status == Status::Running {
+            assert_eq!(job.reason, None, "the wait's reason is cleared");
+        }
         if job.status == Status::Done {
             break;
         }

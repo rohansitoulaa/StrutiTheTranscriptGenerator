@@ -721,16 +721,21 @@ where
         let Some(dir) = self.existing_note_dir(job).await? else {
             return Ok(None);
         };
-        let Ok(relative) = dir.strip_prefix(&self.out_dir) else {
-            return Ok(None);
-        };
-        let parts: Option<Vec<&str>> = relative
-            .components()
-            .map(|c| c.as_os_str().to_str())
-            .collect();
-        Ok(parts
+        let parts: Option<Vec<&str>> = dir.strip_prefix(&self.out_dir).ok().and_then(|relative| {
+            relative
+                .components()
+                .map(|c| c.as_os_str().to_str())
+                .collect()
+        });
+        let folder = parts
             .filter(|p| p.len() == 2 || p.as_slice() == [folders::INBOX])
-            .map(|p| p.join("/")))
+            .map(|p| p.join("/"));
+        if folder.is_none() {
+            // Fine (the note still gets rewritten where it is); the job
+            // just shows no folder.
+            tracing::info!(job = job.id, dir = %dir.display(), "note sits outside Area/Topic; no folder recorded");
+        }
+        Ok(folder)
     }
 
     async fn find_notes(&self, job: &Job) -> Result<Vec<PathBuf>> {
@@ -749,7 +754,7 @@ where
         let root = self.out_dir.clone();
         tokio::task::spawn_blocking(move || f(&root))
             .await
-            .map_err(|e| Error::State(format!("a vault task failed: {e}")))?
+            .map_err(|e| Error::State(format!("a vault task failed: {}", panic_message(e))))?
     }
 
     /// The LLM behind the queue's request slots.
@@ -828,8 +833,13 @@ struct Gated<'a, L> {
 
 impl<L: Llm + Sync> Llm for Gated<'_, L> {
     async fn chat(&self, system: &str, user: &str) -> std::result::Result<ChatReply, LlmError> {
-        // Never closed while the queue exists (see `stopped`).
-        let _slot = self.slots.acquire().await;
+        // Never closed while the queue exists (see `stopped`); fail loudly
+        // rather than run ungated if that ever changes.
+        let _slot = self
+            .slots
+            .acquire()
+            .await
+            .map_err(|_| LlmError::BadResponse("the queue is stopping".into()))?;
         self.llm.chat(system, user).await
     }
 
