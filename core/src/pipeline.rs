@@ -34,12 +34,19 @@ impl<F: Fetcher + Sync, T: Transcriber + Sync> Engine<F, T> {
         }
         let url = source.canonical_url();
         let meta = self.fetcher.metadata(&url).await?;
-        let work = tempfile::tempdir().map_err(fs_err("create a scratch folder in", std::env::temp_dir()))?;
+        let work = tempfile::tempdir()
+            .map_err(fs_err("create a scratch folder in", std::env::temp_dir()))?;
 
         let caption_error = match meta.pick_caption() {
             None => None,
             Some(track) => match self.captions(&url, track, work.path()).await {
-                Ok(transcript) => return Ok(Outcome { meta, transcript, caption_error: None }),
+                Ok(transcript) => {
+                    return Ok(Outcome {
+                        meta,
+                        transcript,
+                        caption_error: None,
+                    });
+                }
                 Err(reason) => {
                     tracing::warn!(key = %meta.key(), %reason, "captions unusable, using whisper");
                     Some(reason)
@@ -48,20 +55,43 @@ impl<F: Fetcher + Sync, T: Transcriber + Sync> Engine<F, T> {
         };
 
         let audio = self.fetcher.audio(&url, work.path()).await?;
-        let transcript = self.transcriber.transcribe(&audio, meta.spoken_language().as_deref()).await?;
+        let transcript = self
+            .transcriber
+            .transcribe(&audio, meta.spoken_language().as_deref())
+            .await?;
         if transcript.is_empty() {
-            return Err(Error::Empty(format!("{} has no detectable speech", meta.key())));
+            return Err(Error::Empty(format!(
+                "{} has no detectable speech",
+                meta.key()
+            )));
         }
-        Ok(Outcome { meta, transcript, caption_error })
+        Ok(Outcome {
+            meta,
+            transcript,
+            caption_error,
+        })
     }
 
     /// The caption track as a transcript, or why it can't be used.
-    async fn captions(&self, url: &str, track: CaptionTrack, dir: &Path) -> std::result::Result<Transcript, String> {
-        let segments = self.fetcher.captions(url, &track, dir).await.map_err(|e| e.to_string())?;
+    async fn captions(
+        &self,
+        url: &str,
+        track: CaptionTrack,
+        dir: &Path,
+    ) -> std::result::Result<Transcript, String> {
+        let segments = self
+            .fetcher
+            .captions(url, &track, dir)
+            .await
+            .map_err(|e| e.to_string())?;
         if segments.iter().all(|s| s.text.trim().is_empty()) {
             return Err(format!("{} caption track was empty", track.code));
         }
-        Ok(Transcript { source: TranscriptSource::Captions(track.kind), language: Some(track.language), segments })
+        Ok(Transcript {
+            source: TranscriptSource::Captions(track.kind),
+            language: Some(track.language),
+            segments,
+        })
     }
 }
 
@@ -98,17 +128,29 @@ mod tests {
             self.calls.push(format!("metadata {url}"));
             match &self.meta {
                 Ok(m) => Ok(m.clone()),
-                Err(e) => Err(Error::Parse { what: "metadata", reason: e.to_string() }),
+                Err(e) => Err(Error::Parse {
+                    what: "metadata",
+                    reason: e.to_string(),
+                }),
             }
         }
-        async fn captions(&self, url: &str, track: &CaptionTrack, _dir: &Path) -> Result<Vec<Segment>> {
+        async fn captions(
+            &self,
+            url: &str,
+            track: &CaptionTrack,
+            _dir: &Path,
+        ) -> Result<Vec<Segment>> {
             self.calls.push(format!("captions {} {url}", track.code));
             (self.captions)()
         }
         async fn audio(&self, url: &str, dir: &Path) -> Result<PathBuf> {
             self.calls.push(format!("audio {url}"));
             if self.audio_fails {
-                return Err(Error::ToolFailed { tool: "yt-dlp", status: "exit 1".into(), stderr: "403".into() });
+                return Err(Error::ToolFailed {
+                    tool: "yt-dlp",
+                    status: "exit 1".into(),
+                    stderr: "403".into(),
+                });
             }
             Ok(dir.join("audio.wav"))
         }
@@ -121,9 +163,17 @@ mod tests {
 
     impl Transcriber for FakeWhisper {
         async fn transcribe(&self, audio: &Path, language: Option<&str>) -> Result<Transcript> {
-            assert_eq!(audio.file_name().unwrap(), "audio.wav", "whisper must get the downloaded file");
-            assert!(audio.parent().unwrap().is_dir(), "scratch folder deleted before whisper ran");
-            self.calls.push(format!("whisper {}", language.unwrap_or("auto")));
+            assert_eq!(
+                audio.file_name().unwrap(),
+                "audio.wav",
+                "whisper must get the downloaded file"
+            );
+            assert!(
+                audio.parent().unwrap().is_dir(),
+                "scratch folder deleted before whisper ran"
+            );
+            self.calls
+                .push(format!("whisper {}", language.unwrap_or("auto")));
             Ok(Transcript {
                 source: TranscriptSource::Whisper,
                 language: Some(language.unwrap_or("en").into()),
@@ -133,7 +183,11 @@ mod tests {
     }
 
     fn seg(text: &str) -> Segment {
-        Segment { start_ms: 0, end_ms: 1000, text: text.into() }
+        Segment {
+            start_ms: 0,
+            end_ms: 1000,
+            text: text.into(),
+        }
     }
 
     fn meta(language: Option<&str>, auto: &[&str]) -> VideoMeta {
@@ -151,10 +205,21 @@ mod tests {
         }
     }
 
-    fn engine(meta: Result<VideoMeta>, captions: fn() -> Result<Vec<Segment>>) -> Engine<FakeFetcher, FakeWhisper> {
+    fn engine(
+        meta: Result<VideoMeta>,
+        captions: fn() -> Result<Vec<Segment>>,
+    ) -> Engine<FakeFetcher, FakeWhisper> {
         Engine {
-            fetcher: FakeFetcher { meta, captions, audio_fails: false, calls: Calls::default() },
-            transcriber: FakeWhisper { segments: vec![seg("from whisper")], calls: Calls::default() },
+            fetcher: FakeFetcher {
+                meta,
+                captions,
+                audio_fails: false,
+                calls: Calls::default(),
+            },
+            transcriber: FakeWhisper {
+                segments: vec![seg("from whisper")],
+                calls: Calls::default(),
+            },
         }
     }
 
@@ -166,36 +231,58 @@ mod tests {
     async fn captions_win_and_whisper_never_runs() {
         let e = engine(Ok(meta(Some("hi"), &["hi-orig"])), || Ok(vec![seg("कैप्शन")]));
         let out = e.transcribe(HI_URL).await.unwrap();
-        assert_eq!(out.transcript.source, TranscriptSource::Captions(CaptionKind::Auto));
+        assert_eq!(
+            out.transcript.source,
+            TranscriptSource::Captions(CaptionKind::Auto)
+        );
         assert_eq!(out.transcript.language.as_deref(), Some("hi"));
         assert_eq!(out.transcript.segments, vec![seg("कैप्शन")]);
         assert_eq!(out.caption_error, None);
-        assert_eq!(e.fetcher.calls.all(), [format!("metadata {CANON}"), format!("captions hi-orig {CANON}")]);
+        assert_eq!(
+            e.fetcher.calls.all(),
+            [
+                format!("metadata {CANON}"),
+                format!("captions hi-orig {CANON}")
+            ]
+        );
         assert!(e.transcriber.calls.all().is_empty());
     }
 
     #[tokio::test]
     async fn caption_failure_falls_back_to_whisper_and_says_why() {
         let e = engine(Ok(meta(Some("hi"), &["hi-orig"])), || {
-            Err(Error::ToolFailed { tool: "yt-dlp", status: "exit 1".into(), stderr: "HTTP Error 429".into() })
+            Err(Error::ToolFailed {
+                tool: "yt-dlp",
+                status: "exit 1".into(),
+                stderr: "HTTP Error 429".into(),
+            })
         });
         let out = e.transcribe(HI_URL).await.unwrap();
         assert_eq!(out.transcript.source, TranscriptSource::Whisper);
         assert!(out.caption_error.as_deref().unwrap().contains("429"));
         assert_eq!(e.transcriber.calls.all(), ["whisper hi"]);
-        assert_eq!(e.fetcher.calls.all().last().unwrap(), &format!("audio {CANON}"));
+        assert_eq!(
+            e.fetcher.calls.all().last().unwrap(),
+            &format!("audio {CANON}")
+        );
     }
 
     #[tokio::test]
     async fn every_kind_of_caption_failure_falls_back_with_its_reason() {
         fn parse_err() -> Result<Vec<Segment>> {
-            Err(Error::Parse { what: "captions", reason: "truncated".into() })
+            Err(Error::Parse {
+                what: "captions",
+                reason: "truncated".into(),
+            })
         }
         fn missing() -> Result<Vec<Segment>> {
             Err(Error::Empty("yt-dlp wrote no hi-orig caption file".into()))
         }
         fn timeout() -> Result<Vec<Segment>> {
-            Err(Error::Timeout { tool: "yt-dlp", secs: 120 })
+            Err(Error::Timeout {
+                tool: "yt-dlp",
+                secs: 120,
+            })
         }
         for (captions, expect) in [
             (parse_err as fn() -> Result<Vec<Segment>>, "truncated"),
@@ -205,7 +292,11 @@ mod tests {
             let e = engine(Ok(meta(Some("hi"), &["hi-orig"])), captions);
             let out = e.transcribe(HI_URL).await.unwrap();
             assert_eq!(out.transcript.source, TranscriptSource::Whisper);
-            assert!(out.caption_error.as_deref().unwrap().contains(expect), "{:?}", out.caption_error);
+            assert!(
+                out.caption_error.as_deref().unwrap().contains(expect),
+                "{:?}",
+                out.caption_error
+            );
         }
     }
 
@@ -214,11 +305,18 @@ mod tests {
         // The caption failure was already logged; the audio error is what
         // actually stopped the job, so that's the reason shown.
         let mut e = engine(Ok(meta(Some("hi"), &["hi-orig"])), || {
-            Err(Error::ToolFailed { tool: "yt-dlp", status: "exit 1".into(), stderr: "HTTP Error 429".into() })
+            Err(Error::ToolFailed {
+                tool: "yt-dlp",
+                status: "exit 1".into(),
+                stderr: "HTTP Error 429".into(),
+            })
         });
         e.fetcher.audio_fails = true;
         let err = e.transcribe(HI_URL).await.unwrap_err();
-        assert!(matches!(err, Error::ToolFailed { ref stderr, .. } if stderr == "403"), "{err:?}");
+        assert!(
+            matches!(err, Error::ToolFailed { ref stderr, .. } if stderr == "403"),
+            "{err:?}"
+        );
         assert!(e.transcriber.calls.all().is_empty());
     }
 
@@ -232,7 +330,9 @@ mod tests {
 
     #[tokio::test]
     async fn no_caption_track_goes_straight_to_whisper_with_detection() {
-        let e = engine(Ok(meta(None, &[])), || panic!("captions must not be fetched"));
+        let e = engine(Ok(meta(None, &[])), || {
+            panic!("captions must not be fetched")
+        });
         let out = e.transcribe(HI_URL).await.unwrap();
         assert_eq!(out.transcript.source, TranscriptSource::Whisper);
         assert_eq!(out.caption_error, None);
@@ -242,27 +342,48 @@ mod tests {
     #[tokio::test]
     async fn collections_are_refused_before_any_network_call() {
         let e = engine(Ok(meta(None, &[])), || unreachable!());
-        let err = e.transcribe("https://www.youtube.com/@kolejain").await.unwrap_err();
+        let err = e
+            .transcribe("https://www.youtube.com/@kolejain")
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::NotYetSupported("channel")), "{err:?}");
-        let err = e.transcribe("https://www.instagram.com/natgeo/").await.unwrap_err();
-        assert!(matches!(err, Error::NotYetSupported("Instagram profile")), "{err:?}");
+        let err = e
+            .transcribe("https://www.instagram.com/natgeo/")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotYetSupported("Instagram profile")),
+            "{err:?}"
+        );
         assert!(e.fetcher.calls.all().is_empty());
     }
 
     #[tokio::test]
     async fn junk_input_is_unsupported() {
         let e = engine(Ok(meta(None, &[])), || unreachable!());
-        assert!(matches!(e.transcribe("hello").await, Err(Error::UnsupportedUrl(_))));
+        assert!(matches!(
+            e.transcribe("hello").await,
+            Err(Error::UnsupportedUrl(_))
+        ));
     }
 
     #[tokio::test]
     async fn metadata_and_audio_errors_propagate() {
         let e = engine(Err(Error::Empty("x".into())), || unreachable!());
-        assert!(matches!(e.transcribe(HI_URL).await, Err(Error::Parse { what: "metadata", .. })));
+        assert!(matches!(
+            e.transcribe(HI_URL).await,
+            Err(Error::Parse {
+                what: "metadata",
+                ..
+            })
+        ));
 
         let mut e = engine(Ok(meta(None, &[])), || unreachable!());
         e.fetcher.audio_fails = true;
-        assert!(matches!(e.transcribe(HI_URL).await, Err(Error::ToolFailed { tool: "yt-dlp", .. })));
+        assert!(matches!(
+            e.transcribe(HI_URL).await,
+            Err(Error::ToolFailed { tool: "yt-dlp", .. })
+        ));
         assert!(e.transcriber.calls.all().is_empty());
     }
 

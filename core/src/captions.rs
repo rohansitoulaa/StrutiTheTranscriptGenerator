@@ -35,8 +35,10 @@ struct Seg {
 }
 
 pub fn parse_json3(json: &str) -> Result<Vec<Segment>> {
-    let doc: Json3 = serde_json::from_str(json)
-        .map_err(|e| Error::Parse { what: "captions", reason: e.to_string() })?;
+    let doc: Json3 = serde_json::from_str(json).map_err(|e| Error::Parse {
+        what: "captions",
+        reason: e.to_string(),
+    })?;
 
     Ok(doc
         .events
@@ -71,7 +73,10 @@ pub(crate) fn strip_annotations(text: &str) -> String {
         }
     }
     out.push_str(rest);
-    out.replace('♪', " ").split_whitespace().collect::<Vec<_>>().join(" ")
+    out.replace('♪', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -111,15 +116,26 @@ mod tests {
         assert_eq!(
             segs,
             vec![
-                Segment { start_ms: 1000, end_ms: 3000, text: "hello world".into() },
-                Segment { start_ms: 3000, end_ms: 4000, text: "la la".into() },
+                Segment {
+                    start_ms: 1000,
+                    end_ms: 3000,
+                    text: "hello world".into()
+                },
+                Segment {
+                    start_ms: 3000,
+                    end_ms: 4000,
+                    text: "la la".into()
+                },
             ]
         );
     }
 
     #[test]
     fn absurd_durations_do_not_overflow() {
-        let json = format!(r#"{{"events":[{{"tStartMs":5,"dDurationMs":{},"segs":[{{"utf8":"x"}}]}}]}}"#, u64::MAX);
+        let json = format!(
+            r#"{{"events":[{{"tStartMs":5,"dDurationMs":{},"segs":[{{"utf8":"x"}}]}}]}}"#,
+            u64::MAX
+        );
         assert_eq!(parse_json3(&json).unwrap()[0].end_ms, u64::MAX);
     }
 

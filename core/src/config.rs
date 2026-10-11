@@ -49,8 +49,10 @@ impl Config {
         let mut c = Config::repo_defaults(repo_root);
         let optional = |v: String| (!v.is_empty()).then_some(v);
         let number = |name: &'static str, v: &str| {
-            v.parse::<u32>()
-                .map_err(|_| Error::Parse { what: "settings", reason: format!("{name}={v:?} is not a number") })
+            v.parse::<u32>().map_err(|_| Error::Parse {
+                what: "settings",
+                reason: format!("{name}={v:?} is not a number"),
+            })
         };
 
         if let Some(v) = var("SHRUTI_YTDLP") {
@@ -78,7 +80,11 @@ impl Config {
             };
         }
         if let Some(v) = var("SHRUTI_THREADS") {
-            c.threads = if v.is_empty() { None } else { Some(number("SHRUTI_THREADS", &v)?) };
+            c.threads = if v.is_empty() {
+                None
+            } else {
+                Some(number("SHRUTI_THREADS", &v)?)
+            };
         }
         Ok(c)
     }
@@ -87,11 +93,14 @@ impl Config {
     /// Programs given as a bare name (`yt-dlp`) are looked up on `PATH`, the
     /// same way they'll be found when spawned.
     pub fn problems(&self) -> Vec<String> {
-        let mut problems: Vec<String> = [("yt-dlp", &self.ytdlp_bin), ("whisper-cli", &self.whisper_bin)]
-            .into_iter()
-            .filter(|(_, bin)| !program_exists(bin))
-            .map(|(what, bin)| format!("{what} not found at {}", bin.display()))
-            .collect();
+        let mut problems: Vec<String> = [
+            ("yt-dlp", &self.ytdlp_bin),
+            ("whisper-cli", &self.whisper_bin),
+        ]
+        .into_iter()
+        .filter(|(_, bin)| !program_exists(bin))
+        .map(|(what, bin)| format!("{what} not found at {}", bin.display()))
+        .collect();
         let mut files = vec![("Whisper model", &self.whisper_model)];
         if let Some(vad) = &self.vad_model {
             files.push(("VAD model", vad));
@@ -125,7 +134,10 @@ impl Config {
             js_runtime: self.js_runtime.clone(),
             cookies_from_browser: self.cookies_from_browser.clone(),
         };
-        Ok(Engine { fetcher: ytdlp, transcriber: whisper })
+        Ok(Engine {
+            fetcher: ytdlp,
+            transcriber: whisper,
+        })
     }
 }
 
@@ -144,7 +156,10 @@ mod tests {
     use std::collections::HashMap;
 
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         move |k| map.get(k).cloned()
     }
 
@@ -154,9 +169,18 @@ mod tests {
         assert_eq!(c.ytdlp_bin, PathBuf::from("yt-dlp"));
         assert_eq!(c.js_runtime.as_deref(), Some("node"));
         assert_eq!(c.cookies_from_browser, None);
-        assert_eq!(c.whisper_bin, PathBuf::from("/repo/vendor/whisper.cpp/build/bin/whisper-cli"));
-        assert_eq!(c.whisper_model, PathBuf::from("/repo/models/ggml-large-v3-turbo-q5_0.bin"));
-        assert_eq!(c.vad_model, Some(PathBuf::from("/repo/models/ggml-silero-v5.1.2.bin")));
+        assert_eq!(
+            c.whisper_bin,
+            PathBuf::from("/repo/vendor/whisper.cpp/build/bin/whisper-cli")
+        );
+        assert_eq!(
+            c.whisper_model,
+            PathBuf::from("/repo/models/ggml-large-v3-turbo-q5_0.bin")
+        );
+        assert_eq!(
+            c.vad_model,
+            Some(PathBuf::from("/repo/models/ggml-silero-v5.1.2.bin"))
+        );
         assert_eq!(c.gpu, GpuChoice::Auto);
         assert_eq!(c.threads, None);
     }
@@ -208,7 +232,10 @@ mod tests {
     #[test]
     fn problems_lists_missing_files() {
         let dir = tempfile::tempdir().unwrap();
-        let c = Config { ytdlp_bin: "sh".into(), ..Config::repo_defaults(dir.path()) };
+        let c = Config {
+            ytdlp_bin: "sh".into(),
+            ..Config::repo_defaults(dir.path())
+        };
         let problems = c.problems();
         assert_eq!(problems.len(), 3, "{problems:?}");
         assert!(problems.iter().any(|p| p.contains("whisper-cli")));
@@ -217,7 +244,11 @@ mod tests {
 
         std::fs::create_dir_all(dir.path().join("models")).unwrap();
         std::fs::write(dir.path().join("models/ggml-large-v3-turbo-q5_0.bin"), "").unwrap();
-        let c = Config { vad_model: None, ytdlp_bin: "sh".into(), ..Config::repo_defaults(dir.path()) };
+        let c = Config {
+            vad_model: None,
+            ytdlp_bin: "sh".into(),
+            ..Config::repo_defaults(dir.path())
+        };
         assert_eq!(c.problems().len(), 1);
     }
 
@@ -225,9 +256,26 @@ mod tests {
     fn programs_are_found_on_path_or_reported() {
         let dir = tempfile::tempdir().unwrap();
         let base = Config::repo_defaults(dir.path());
-        let on_path = Config { whisper_bin: "sh".into(), ytdlp_bin: "sh".into(), ..base.clone() };
-        assert!(!on_path.problems().iter().any(|p| p.contains("whisper-cli") || p.contains("yt-dlp")));
-        let missing = Config { ytdlp_bin: "no-such-program-shruti".into(), ..base };
-        assert!(missing.problems().iter().any(|p| p == "yt-dlp not found at no-such-program-shruti"));
+        let on_path = Config {
+            whisper_bin: "sh".into(),
+            ytdlp_bin: "sh".into(),
+            ..base.clone()
+        };
+        assert!(
+            !on_path
+                .problems()
+                .iter()
+                .any(|p| p.contains("whisper-cli") || p.contains("yt-dlp"))
+        );
+        let missing = Config {
+            ytdlp_bin: "no-such-program-shruti".into(),
+            ..base
+        };
+        assert!(
+            missing
+                .problems()
+                .iter()
+                .any(|p| p == "yt-dlp not found at no-such-program-shruti")
+        );
     }
 }

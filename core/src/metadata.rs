@@ -77,10 +77,16 @@ const ORIG_SUFFIX: &str = "-orig";
 
 impl VideoMeta {
     pub fn from_ytdlp_json(json: &str) -> Result<Self> {
-        let parse_err = |reason: String| Error::Parse { what: "yt-dlp metadata", reason };
+        let parse_err = |reason: String| Error::Parse {
+            what: "yt-dlp metadata",
+            reason,
+        };
         let raw: RawMeta = serde_json::from_str(json).map_err(|e| parse_err(e.to_string()))?;
 
-        let id = raw.id.filter(|s| !s.is_empty()).ok_or_else(|| parse_err("no video id".into()))?;
+        let id = raw
+            .id
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| parse_err("no video id".into()))?;
         let extractor = raw.extractor_key.unwrap_or_default();
         let platform = if extractor == "Youtube" {
             Platform::YouTube
@@ -101,12 +107,28 @@ impl VideoMeta {
                 Platform::Instagram => format!("https://www.instagram.com/reel/{id}/"),
             }),
             title: title.unwrap_or_default(),
-            channel: non_empty(raw.channel).or(non_empty(raw.uploader)).or(non_empty(raw.uploader_id)),
-            upload_date: raw.upload_date.as_deref().and_then(|d| checked_date(&id, d)),
-            duration_secs: raw.duration.filter(|d| d.is_finite() && *d >= 0.0).map(|d| d.round() as u64),
+            channel: non_empty(raw.channel)
+                .or(non_empty(raw.uploader))
+                .or(non_empty(raw.uploader_id)),
+            upload_date: raw
+                .upload_date
+                .as_deref()
+                .and_then(|d| checked_date(&id, d)),
+            duration_secs: raw
+                .duration
+                .filter(|d| d.is_finite() && *d >= 0.0)
+                .map(|d| d.round() as u64),
             language: non_empty(raw.language).filter(|l| checked_language(&id, l)),
-            subtitles: raw.subtitles.into_keys().filter(|k| k != "live_chat" && track_code_ok(&id, k)).collect(),
-            auto_captions: raw.automatic_captions.into_keys().filter(|k| track_code_ok(&id, k)).collect(),
+            subtitles: raw
+                .subtitles
+                .into_keys()
+                .filter(|k| k != "live_chat" && track_code_ok(&id, k))
+                .collect(),
+            auto_captions: raw
+                .automatic_captions
+                .into_keys()
+                .filter(|k| track_code_ok(&id, k))
+                .collect(),
             id,
         })
     }
@@ -134,13 +156,17 @@ impl VideoMeta {
     /// machine-translated one).
     pub fn pick_caption(&self) -> Option<CaptionTrack> {
         let lang = self.spoken_language()?;
-        let track = |code: &str, kind| CaptionTrack { code: code.to_string(), kind, language: lang.clone() };
+        let track = |code: &str, kind| CaptionTrack {
+            code: code.to_string(),
+            kind,
+            language: lang.clone(),
+        };
 
-        let manual = self
-            .subtitles
-            .iter()
-            .find(|c| **c == lang)
-            .or_else(|| self.subtitles.iter().find(|c| is_regional_variant(c, &lang)));
+        let manual = self.subtitles.iter().find(|c| **c == lang).or_else(|| {
+            self.subtitles
+                .iter()
+                .find(|c| is_regional_variant(c, &lang))
+        });
         if let Some(code) = manual {
             return Some(track(code, CaptionKind::Manual));
         }
@@ -190,7 +216,10 @@ pub fn language_tag(code: &str) -> Option<String> {
 /// `en-GB`, `es-419`, `zh-Hans` are variants of their language; `en-de` (a
 /// lowercase second part) is YouTube's naming for a machine translation.
 fn is_regional_variant(code: &str, lang: &str) -> bool {
-    let Some(sub) = code.strip_prefix(lang).and_then(|rest| rest.strip_prefix('-')) else {
+    let Some(sub) = code
+        .strip_prefix(lang)
+        .and_then(|rest| rest.strip_prefix('-'))
+    else {
         return false;
     };
     let region = sub.len() == 2 && sub.bytes().all(|b| b.is_ascii_uppercase());
@@ -216,7 +245,9 @@ fn track_code_ok(id: &str, code: &str) -> bool {
 fn is_track_code(code: &str) -> bool {
     (1..=32).contains(&code.len())
         && !code.starts_with('-')
-        && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 /// yt-dlp's `YYYYMMDD` → `YYYY-MM-DD`.
@@ -236,7 +267,10 @@ mod tests {
 
     fn meta_with(language: &str, subs: &[&str], auto: &[&str]) -> VideoMeta {
         let tracks = |codes: &[&str]| -> serde_json::Value {
-            codes.iter().map(|c| (c.to_string(), serde_json::json!([{"ext": "json3"}]))).collect()
+            codes
+                .iter()
+                .map(|c| (c.to_string(), serde_json::json!([{"ext": "json3"}])))
+                .collect()
         };
         let json = serde_json::json!({
             "id": "abcdefghijk", "title": "t", "extractor_key": "Youtube",
@@ -274,7 +308,11 @@ mod tests {
         assert_eq!(m.spoken_language().as_deref(), Some("hi"));
         assert_eq!(
             m.pick_caption(),
-            Some(CaptionTrack { code: "hi-orig".into(), kind: CaptionKind::Auto, language: "hi".into() })
+            Some(CaptionTrack {
+                code: "hi-orig".into(),
+                kind: CaptionKind::Auto,
+                language: "hi".into()
+            })
         );
     }
 
@@ -291,7 +329,11 @@ mod tests {
         let m = meta_with("en", &["de", "en-GB", "en"], &["en-orig"]);
         assert_eq!(
             m.pick_caption(),
-            Some(CaptionTrack { code: "en".into(), kind: CaptionKind::Manual, language: "en".into() })
+            Some(CaptionTrack {
+                code: "en".into(),
+                kind: CaptionKind::Manual,
+                language: "en".into()
+            })
         );
         let m = meta_with("en", &["de", "en-GB"], &["en-orig"]);
         assert_eq!(m.pick_caption().unwrap().code, "en-GB");
@@ -301,8 +343,20 @@ mod tests {
     #[test]
     fn translation_shaped_codes_are_not_regional_variants() {
         assert_eq!(meta_with("en", &["en-de"], &[]).pick_caption(), None);
-        assert_eq!(meta_with("es", &["es-419"], &[]).pick_caption().unwrap().code, "es-419");
-        assert_eq!(meta_with("zh", &["zh-Hans"], &[]).pick_caption().unwrap().code, "zh-Hans");
+        assert_eq!(
+            meta_with("es", &["es-419"], &[])
+                .pick_caption()
+                .unwrap()
+                .code,
+            "es-419"
+        );
+        assert_eq!(
+            meta_with("zh", &["zh-Hans"], &[])
+                .pick_caption()
+                .unwrap()
+                .code,
+            "zh-Hans"
+        );
     }
 
     #[test]
@@ -318,7 +372,11 @@ mod tests {
 
     #[test]
     fn hostile_track_codes_are_dropped() {
-        let m = meta_with("en", &["../../etc/passwd", "--exec", "en"], &["en-orig", "a b"]);
+        let m = meta_with(
+            "en",
+            &["../../etc/passwd", "--exec", "en"],
+            &["en-orig", "a b"],
+        );
         assert_eq!(m.subtitles, vec!["en"]);
         assert_eq!(m.auto_captions, vec!["en-orig"]);
     }
@@ -375,12 +433,20 @@ mod tests {
         let json = serde_json::json!({
             "id": "abcdefghijk", "title": "t", "extractor_key": "Youtube", "upload_date": "2026-1",
         });
-        assert_eq!(VideoMeta::from_ytdlp_json(&json.to_string()).unwrap().upload_date, None);
+        assert_eq!(
+            VideoMeta::from_ytdlp_json(&json.to_string())
+                .unwrap()
+                .upload_date,
+            None
+        );
     }
 
     #[test]
     fn rejects_garbage_and_missing_ids() {
-        assert!(matches!(VideoMeta::from_ytdlp_json("not json"), Err(Error::Parse { .. })));
+        assert!(matches!(
+            VideoMeta::from_ytdlp_json("not json"),
+            Err(Error::Parse { .. })
+        ));
         assert!(matches!(
             VideoMeta::from_ytdlp_json(r#"{"title":"x","extractor_key":"Youtube"}"#),
             Err(Error::Parse { .. })

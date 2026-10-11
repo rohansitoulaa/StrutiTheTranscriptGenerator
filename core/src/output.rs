@@ -22,7 +22,8 @@ const TITLE_FROM_TEXT_WORDS: usize = 8;
 /// use the opening words of the transcript instead (PDA OUT-3).
 pub fn note_title(meta: &VideoMeta, transcript: &Transcript) -> String {
     let title = meta.title.trim();
-    let placeholder = meta.platform == Platform::Instagram && (title.is_empty() || title.starts_with("Video by "));
+    let placeholder = meta.platform == Platform::Instagram
+        && (title.is_empty() || title.starts_with("Video by "));
     if !placeholder {
         return title.to_string();
     }
@@ -45,10 +46,18 @@ pub fn note_title(meta: &VideoMeta, transcript: &Transcript) -> String {
 pub fn note_filename(date: Option<&str>, title: &str) -> String {
     let cleaned: String = title
         .chars()
-        .map(|c| if c.is_control() || r#"/\:*?"<>|"#.contains(c) { ' ' } else { c })
+        .map(|c| {
+            if c.is_control() || r#"/\:*?"<>|"#.contains(c) {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let mut name = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    name = name.trim_matches(|c: char| c == '.' || c == ' ').to_string();
+    name = name
+        .trim_matches(|c: char| c == '.' || c == ' ')
+        .to_string();
     if name.is_empty() {
         name = "Untitled".into();
     }
@@ -65,7 +74,9 @@ pub fn note_filename(date: Option<&str>, title: &str) -> String {
                 bytes <= MAX_FILENAME_BYTES
             })
             .collect::<String>();
-        name = name.trim_end_matches(|c: char| c == '.' || c.is_whitespace()).to_string();
+        name = name
+            .trim_end_matches(|c: char| c == '.' || c.is_whitespace())
+            .to_string();
     }
     format!("{name}.md")
 }
@@ -74,7 +85,10 @@ pub fn render_note(meta: &VideoMeta, transcript: &Transcript, today: &str) -> St
     // JSON string literals are valid YAML double-quoted scalars, so
     // serde_json does the escaping for free-text fields.
     let quoted = |s: &str| serde_json::Value::String(s.to_string()).to_string();
-    let language = transcript.language.clone().or_else(|| meta.spoken_language());
+    let language = transcript
+        .language
+        .clone()
+        .or_else(|| meta.spoken_language());
 
     let mut fm = vec![
         format!("title: {}", quoted(&note_title(meta, transcript))),
@@ -106,19 +120,37 @@ pub fn render_note(meta: &VideoMeta, transcript: &Transcript, today: &str) -> St
 /// the new one gets ` (2)`, ` (3)`, …. If an existing note already has the
 /// same content (ignoring the `transcribed:` date), it's reused, so running
 /// the same link twice doesn't pile up copies.
-pub async fn write_note(dir: &Path, meta: &VideoMeta, transcript: &Transcript, today: &str) -> Result<PathBuf> {
-    tokio::fs::create_dir_all(dir).await.map_err(fs_err("create folder", dir))?;
+pub async fn write_note(
+    dir: &Path,
+    meta: &VideoMeta,
+    transcript: &Transcript,
+    today: &str,
+) -> Result<PathBuf> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(fs_err("create folder", dir))?;
     let file_name = note_filename(meta.upload_date.as_deref(), &note_title(meta, transcript));
     let stem = file_name.trim_end_matches(".md");
     let body = render_note(meta, transcript, today);
 
     for n in 1..=MAX_COPIES {
-        let candidate = if n == 1 { dir.join(&file_name) } else { dir.join(format!("{stem} ({n}).md")) };
+        let candidate = if n == 1 {
+            dir.join(&file_name)
+        } else {
+            dir.join(format!("{stem} ({n}).md"))
+        };
         // `create_new` makes "exists?" and "create" one atomic step, so a
         // concurrent writer can't slip in between and get overwritten.
-        match tokio::fs::OpenOptions::new().write(true).create_new(true).open(&candidate).await {
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .await
+        {
             Ok(mut file) => {
-                file.write_all(body.as_bytes()).await.map_err(fs_err("write", &candidate))?;
+                file.write_all(body.as_bytes())
+                    .await
+                    .map_err(fs_err("write", &candidate))?;
                 file.flush().await.map_err(fs_err("write", &candidate))?;
                 return Ok(candidate);
             }
@@ -128,7 +160,9 @@ pub async fn write_note(dir: &Path, meta: &VideoMeta, transcript: &Transcript, t
                     Ok(_) => {}
                     // Unreadable (permissions, not UTF-8): it can't be the
                     // same note, so move on, but leave a trace.
-                    Err(e) => tracing::warn!(path = %candidate.display(), error = %e, "existing note unreadable"),
+                    Err(e) => {
+                        tracing::warn!(path = %candidate.display(), error = %e, "existing note unreadable")
+                    }
                 }
             }
             Err(e) => return Err(fs_err("create", &candidate)(e)),
@@ -146,7 +180,10 @@ const MAX_COPIES: u32 = 1_000;
 
 fn same_note(a: &str, b: &str) -> bool {
     let without_date = |s: &str| {
-        s.lines().filter(|l| !l.starts_with("transcribed: ")).collect::<Vec<_>>().join("\n")
+        s.lines()
+            .filter(|l| !l.starts_with("transcribed: "))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     without_date(a) == without_date(b)
 }
@@ -191,19 +228,32 @@ mod tests {
             segments: texts
                 .iter()
                 .enumerate()
-                .map(|(i, t)| Segment { start_ms: i as u64 * 1000, end_ms: i as u64 * 1000 + 900, text: t.to_string() })
+                .map(|(i, t)| Segment {
+                    start_ms: i as u64 * 1000,
+                    end_ms: i as u64 * 1000 + 900,
+                    text: t.to_string(),
+                })
                 .collect(),
         }
     }
 
     #[test]
     fn filenames() {
-        assert_eq!(note_filename(Some("2005-04-24"), "Me at the zoo"), "2005-04-24 Me at the zoo.md");
+        assert_eq!(
+            note_filename(Some("2005-04-24"), "Me at the zoo"),
+            "2005-04-24 Me at the zoo.md"
+        );
         assert_eq!(note_filename(None, "Me at the zoo"), "Me at the zoo.md");
         assert_eq!(note_filename(None, "What is UI/UX?"), "What is UI UX.md");
         assert_eq!(note_filename(None, r#"a\b: "c" <d>|e*"#), "a b c d e.md");
-        assert_eq!(note_filename(None, "  ..dots and spaces..  "), "dots and spaces.md");
-        assert_eq!(note_filename(None, "tab\tand\nnewline"), "tab and newline.md");
+        assert_eq!(
+            note_filename(None, "  ..dots and spaces..  "),
+            "dots and spaces.md"
+        );
+        assert_eq!(
+            note_filename(None, "tab\tand\nnewline"),
+            "tab and newline.md"
+        );
         assert_eq!(note_filename(None, " / "), "Untitled.md");
     }
 
@@ -218,19 +268,35 @@ mod tests {
 
     #[test]
     fn youtube_title_is_the_video_title() {
-        assert_eq!(note_title(&zoo(), &transcript(&["anything"])), "Me at the zoo");
+        assert_eq!(
+            note_title(&zoo(), &transcript(&["anything"])),
+            "Me at the zoo"
+        );
     }
 
     #[test]
     fn reel_title_comes_from_the_transcript() {
-        let t = transcript(&["Three things nobody tells you about", "designing onboarding flows for apps"]);
-        assert_eq!(note_title(&reel(), &t), "Three things nobody tells you about designing onboarding");
-        assert_eq!(note_title(&reel(), &transcript(&[])), "Instagram reel DPx0yXkkS5M");
+        let t = transcript(&[
+            "Three things nobody tells you about",
+            "designing onboarding flows for apps",
+        ]);
+        assert_eq!(
+            note_title(&reel(), &t),
+            "Three things nobody tells you about designing onboarding"
+        );
+        assert_eq!(
+            note_title(&reel(), &transcript(&[])),
+            "Instagram reel DPx0yXkkS5M"
+        );
     }
 
     #[test]
     fn renders_frontmatter_and_body() {
-        let note = render_note(&zoo(), &transcript(&["Alright, so here we are.", "That's cool."]), "2026-10-11");
+        let note = render_note(
+            &zoo(),
+            &transcript(&["Alright, so here we are.", "That's cool."]),
+            "2026-10-11",
+        );
         assert_eq!(
             note,
             "---\n\
@@ -262,7 +328,10 @@ mod tests {
         let mut t = transcript(&["x"]);
         t.language = None;
         let note = render_note(&meta, &t, "2026-10-11");
-        assert!(note.contains(r#"title: "He said \"hi\"\nthen left""#), "{note}");
+        assert!(
+            note.contains(r#"title: "He said \"hi\"\nthen left""#),
+            "{note}"
+        );
         assert!(!note.contains("channel:"));
         assert!(!note.contains("upload_date:"));
         assert!(!note.contains("duration:"));
@@ -273,11 +342,17 @@ mod tests {
     async fn write_note_never_overwrites_a_different_note() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("nested/Inbox");
-        let p1 = write_note(&out, &zoo(), &transcript(&["first"]), "2026-10-11").await.unwrap();
+        let p1 = write_note(&out, &zoo(), &transcript(&["first"]), "2026-10-11")
+            .await
+            .unwrap();
         assert_eq!(p1, out.join("2005-04-24 Me at the zoo.md"));
-        let p2 = write_note(&out, &zoo(), &transcript(&["second"]), "2026-10-11").await.unwrap();
+        let p2 = write_note(&out, &zoo(), &transcript(&["second"]), "2026-10-11")
+            .await
+            .unwrap();
         assert_eq!(p2, out.join("2005-04-24 Me at the zoo (2).md"));
-        let p3 = write_note(&out, &zoo(), &transcript(&["third"]), "2026-10-11").await.unwrap();
+        let p3 = write_note(&out, &zoo(), &transcript(&["third"]), "2026-10-11")
+            .await
+            .unwrap();
         assert_eq!(p3, out.join("2005-04-24 Me at the zoo (3).md"));
         assert!(std::fs::read_to_string(&p1).unwrap().ends_with("first\n"));
         assert!(std::fs::read_to_string(&p2).unwrap().ends_with("second\n"));
@@ -287,20 +362,32 @@ mod tests {
     async fn rerunning_the_same_link_reuses_the_note_even_on_another_day() {
         let dir = tempfile::tempdir().unwrap();
         let t = transcript(&["same words"]);
-        let p1 = write_note(dir.path(), &zoo(), &t, "2026-10-11").await.unwrap();
-        let p2 = write_note(dir.path(), &zoo(), &t, "2026-10-12").await.unwrap();
+        let p1 = write_note(dir.path(), &zoo(), &t, "2026-10-11")
+            .await
+            .unwrap();
+        let p2 = write_note(dir.path(), &zoo(), &t, "2026-10-12")
+            .await
+            .unwrap();
         assert_eq!(p1, p2);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-        assert!(std::fs::read_to_string(&p1).unwrap().contains("transcribed: 2026-10-11"));
+        assert!(
+            std::fs::read_to_string(&p1)
+                .unwrap()
+                .contains("transcribed: 2026-10-11")
+        );
     }
 
     #[tokio::test]
     async fn an_edited_note_is_not_reused_or_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let t = transcript(&["same words"]);
-        let p1 = write_note(dir.path(), &zoo(), &t, "2026-10-11").await.unwrap();
+        let p1 = write_note(dir.path(), &zoo(), &t, "2026-10-11")
+            .await
+            .unwrap();
         std::fs::write(&p1, "my own edits").unwrap();
-        let p2 = write_note(dir.path(), &zoo(), &t, "2026-10-11").await.unwrap();
+        let p2 = write_note(dir.path(), &zoo(), &t, "2026-10-11")
+            .await
+            .unwrap();
         assert_ne!(p1, p2);
         assert_eq!(std::fs::read_to_string(&p1).unwrap(), "my own edits");
     }
@@ -313,7 +400,9 @@ mod tests {
                 let dir = dir.path().to_path_buf();
                 tokio::spawn(async move {
                     let words = format!("writer {i}");
-                    let path = write_note(&dir, &zoo(), &transcript(&[&words]), "2026-10-11").await.unwrap();
+                    let path = write_note(&dir, &zoo(), &transcript(&[&words]), "2026-10-11")
+                        .await
+                        .unwrap();
                     (path, words)
                 })
             })
@@ -321,7 +410,11 @@ mod tests {
         let mut paths = std::collections::HashSet::new();
         for task in tasks {
             let (path, words) = task.await.unwrap();
-            assert!(std::fs::read_to_string(&path).unwrap().ends_with(&format!("{words}\n")));
+            assert!(
+                std::fs::read_to_string(&path)
+                    .unwrap()
+                    .ends_with(&format!("{words}\n"))
+            );
             assert!(paths.insert(path), "two writers got the same file");
         }
         assert_eq!(paths.len(), 8);
@@ -330,6 +423,10 @@ mod tests {
     #[test]
     fn devanagari_titles_fit_the_filesystem_byte_limit() {
         let name = note_filename(Some("2026-10-07"), &"दृश्यम ".repeat(40));
-        assert!(name.len() <= MAX_FILENAME_BYTES + ".md".len(), "{} bytes", name.len());
+        assert!(
+            name.len() <= MAX_FILENAME_BYTES + ".md".len(),
+            "{} bytes",
+            name.len()
+        );
     }
 }

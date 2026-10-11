@@ -90,18 +90,32 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     fn seg(start_ms: u64, end_ms: u64, text: &str) -> Segment {
-        Segment { start_ms, end_ms, text: text.into() }
+        Segment {
+            start_ms,
+            end_ms,
+            text: text.into(),
+        }
     }
 
     #[test]
     fn joins_segments_and_trims_whitespace() {
-        let segs = [seg(0, 1000, " Alright, so here we are,"), seg(1000, 2000, "  one of the elephants. ")];
-        assert_eq!(paragraphs(&segs), vec!["Alright, so here we are, one of the elephants."]);
+        let segs = [
+            seg(0, 1000, " Alright, so here we are,"),
+            seg(1000, 2000, "  one of the elephants. "),
+        ];
+        assert_eq!(
+            paragraphs(&segs),
+            vec!["Alright, so here we are, one of the elephants."]
+        );
     }
 
     #[test]
     fn long_pause_starts_a_new_paragraph() {
-        let segs = [seg(0, 1000, "First."), seg(1500, 2000, "Still first."), seg(4000, 5000, "Second.")];
+        let segs = [
+            seg(0, 1000, "First."),
+            seg(1500, 2000, "Still first."),
+            seg(4000, 5000, "Second."),
+        ];
         assert_eq!(paragraphs(&segs), vec!["First. Still first.", "Second."]);
     }
 
@@ -123,7 +137,10 @@ mod tests {
     #[test]
     fn devanagari_danda_ends_a_sentence() {
         let segs = [seg(0, 1, "यह मूवी आखिरी चैप्टर है।"), seg(1, 2, "इसीलिए अब")];
-        assert_eq!(paragraphs_with(&segs, 2_000, 5), vec!["यह मूवी आखिरी चैप्टर है।", "इसीलिए अब"]);
+        assert_eq!(
+            paragraphs_with(&segs, 2_000, 5),
+            vec!["यह मूवी आखिरी चैप्टर है।", "इसीलिए अब"]
+        );
     }
 
     #[test]
@@ -142,7 +159,10 @@ mod tests {
         };
         assert_eq!(t.text(), "A.\n\nB.");
         assert!(!t.is_empty());
-        let empty = Transcript { segments: vec![seg(0, 1, " ")], ..t };
+        let empty = Transcript {
+            segments: vec![seg(0, 1, " ")],
+            ..t
+        };
         assert!(empty.is_empty());
     }
 }

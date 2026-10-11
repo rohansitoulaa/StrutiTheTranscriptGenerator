@@ -48,9 +48,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Attaches the path and the operation to an I/O error, so a log line says
 /// which file failed instead of a bare "No such file or directory".
-pub(crate) fn fs_err(action: &'static str, path: impl Into<PathBuf>) -> impl FnOnce(io::Error) -> Error {
+pub(crate) fn fs_err(
+    action: &'static str,
+    path: impl Into<PathBuf>,
+) -> impl FnOnce(io::Error) -> Error {
     let path = path.into();
-    move |source| Error::Fs { action, path, source }
+    move |source| Error::Fs {
+        action,
+        path,
+        source,
+    }
 }
 
 /// Keep the end of a tool's stderr: that is where yt-dlp and whisper print the
@@ -83,7 +90,11 @@ mod tests {
 
     #[test]
     fn fs_errors_name_the_path_and_action() {
-        let err = fs_err("write", "/vault/Shruti/a.md")(io::Error::from(io::ErrorKind::PermissionDenied));
-        assert_eq!(err.to_string(), "could not write /vault/Shruti/a.md: permission denied");
+        let err =
+            fs_err("write", "/vault/Shruti/a.md")(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            err.to_string(),
+            "could not write /vault/Shruti/a.md: permission denied"
+        );
     }
 }

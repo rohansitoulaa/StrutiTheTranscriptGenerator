@@ -46,11 +46,18 @@ async fn main() -> ExitCode {
             failed += 1;
         }
     }
-    if failed == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 fn parse_args(mut raw: impl Iterator<Item = String>) -> Option<Args> {
-    let mut args = Args { out_dir: PathBuf::from("out"), links: Vec::new() };
+    let mut args = Args {
+        out_dir: PathBuf::from("out"),
+        links: Vec::new(),
+    };
     while let Some(arg) = raw.next() {
         match arg.as_str() {
             "--out" | "-o" => args.out_dir = raw.next()?.into(),
@@ -62,8 +69,11 @@ fn parse_args(mut raw: impl Iterator<Item = String>) -> Option<Args> {
 }
 
 async fn setup() -> Result<Engine<YtDlp, WhisperCli>, String> {
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap_or(Path::new("."));
-    let config = Config::from_env(repo_root, |k| std::env::var(k).ok()).map_err(|e| e.to_string())?;
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or(Path::new("."));
+    let config =
+        Config::from_env(repo_root, |k| std::env::var(k).ok()).map_err(|e| e.to_string())?;
     let problems = config.problems();
     if !problems.is_empty() {
         return Err(problems.join("\n"));
@@ -77,7 +87,12 @@ async fn setup() -> Result<Engine<YtDlp, WhisperCli>, String> {
 }
 
 /// Returns whether the link produced a note.
-async fn process_link(engine: &Engine<YtDlp, WhisperCli>, link: &str, out_dir: &Path, today: &str) -> bool {
+async fn process_link(
+    engine: &Engine<YtDlp, WhisperCli>,
+    link: &str,
+    out_dir: &Path,
+    today: &str,
+) -> bool {
     let started = Instant::now();
     let result = match engine.transcribe(link).await {
         Ok(outcome) => write_note(out_dir, &outcome.meta, &outcome.transcript, today)
@@ -100,7 +115,11 @@ async fn process_link(engine: &Engine<YtDlp, WhisperCli>, link: &str, out_dir: &
             true
         }
         Err(e) => {
-            println!("fail  {secs:>5.1}s  {}\n      {}", printable(link), printable(&e.to_string()));
+            println!(
+                "fail  {secs:>5.1}s  {}\n      {}",
+                printable(link),
+                printable(&e.to_string())
+            );
             false
         }
     }
@@ -109,5 +128,7 @@ async fn process_link(engine: &Engine<YtDlp, WhisperCli>, link: &str, out_dir: &
 /// Tool output and pasted links can carry terminal escape sequences; keep
 /// only printable text, newlines and tabs.
 fn printable(s: &str) -> String {
-    s.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect()
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+        .collect()
 }

@@ -54,13 +54,23 @@ impl YtDlp {
 
     pub fn metadata_args(&self, url: &str) -> Vec<OsString> {
         let mut args = self.base_args();
-        args.extend(["-J".into(), "--skip-download".into(), "--no-playlist".into(), url.into()]);
+        args.extend([
+            "-J".into(),
+            "--skip-download".into(),
+            "--no-playlist".into(),
+            url.into(),
+        ]);
         args
     }
 
     /// One exact track code. A pattern like `en.*` would also pull YouTube's
     /// machine translations (`en-de`, …), which got rate-limited in testing.
-    pub fn captions_args(&self, url: &str, track: &CaptionTrack, out_template: &Path) -> Vec<OsString> {
+    pub fn captions_args(
+        &self,
+        url: &str,
+        track: &CaptionTrack,
+        out_template: &Path,
+    ) -> Vec<OsString> {
         let write = match track.kind {
             CaptionKind::Manual => "--write-subs",
             CaptionKind::Auto => "--write-auto-subs",
@@ -103,20 +113,33 @@ impl YtDlp {
 impl Fetcher for YtDlp {
     async fn metadata(&self, url: &str) -> Result<VideoMeta> {
         let out = run_tool("yt-dlp", &self.bin, &self.metadata_args(url), QUICK).await?;
-        let json = std::str::from_utf8(&out.stdout)
-            .map_err(|e| Error::Parse { what: "yt-dlp metadata", reason: e.to_string() })?;
+        let json = std::str::from_utf8(&out.stdout).map_err(|e| Error::Parse {
+            what: "yt-dlp metadata",
+            reason: e.to_string(),
+        })?;
         VideoMeta::from_ytdlp_json(json)
     }
 
     async fn captions(&self, url: &str, track: &CaptionTrack, dir: &Path) -> Result<Vec<Segment>> {
         let template = dir.join(CAPTION_STEM);
-        let out = run_tool("yt-dlp", &self.bin, &self.captions_args(url, track, &template), QUICK).await?;
+        let out = run_tool(
+            "yt-dlp",
+            &self.bin,
+            &self.captions_args(url, track, &template),
+            QUICK,
+        )
+        .await?;
         // yt-dlp exits 0 when a requested track doesn't exist, so a missing
         // file is the failure signal. Its stderr usually says why.
         let path = caption_file(dir, &track.code).ok_or_else(|| {
-            Error::Empty(with_stderr(format!("yt-dlp wrote no {} caption file", track.code), &out.stderr))
+            Error::Empty(with_stderr(
+                format!("yt-dlp wrote no {} caption file", track.code),
+                &out.stderr,
+            ))
         })?;
-        let json = tokio::fs::read_to_string(&path).await.map_err(fs_err("read captions", &path))?;
+        let json = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(fs_err("read captions", &path))?;
         parse_json3(&json)
     }
 
@@ -127,14 +150,20 @@ impl Fetcher for YtDlp {
         let size = match tokio::fs::metadata(&wav).await {
             Ok(m) => m.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::Empty(with_stderr("yt-dlp finished but wrote no audio file".into(), &out.stderr)));
+                return Err(Error::Empty(with_stderr(
+                    "yt-dlp finished but wrote no audio file".into(),
+                    &out.stderr,
+                )));
             }
             Err(e) => return Err(fs_err("read", &wav)(e)),
         };
         // A WAV header alone is 44 bytes; anything under a tenth of a second
         // of 16 kHz mono audio means the conversion was cut short.
         if size < MIN_AUDIO_BYTES {
-            return Err(Error::Empty(with_stderr(format!("audio file is only {size} bytes"), &out.stderr)));
+            return Err(Error::Empty(with_stderr(
+                format!("audio file is only {size} bytes"),
+                &out.stderr,
+            )));
         }
         Ok(wav)
     }
@@ -144,7 +173,11 @@ const MIN_AUDIO_BYTES: u64 = 44 + 3_200;
 
 fn with_stderr(msg: String, stderr: &[u8]) -> String {
     let tail = stderr_tail(stderr, 500);
-    if tail.is_empty() { msg } else { format!("{msg}: {tail}") }
+    if tail.is_empty() {
+        msg
+    } else {
+        format!("{msg}: {tail}")
+    }
 }
 
 /// yt-dlp names subtitle files `<stem>.<code>.<ext>`.
@@ -161,11 +194,19 @@ mod tests {
     const URL: &str = "https://www.youtube.com/watch?v=jNQXAC9IVRw";
 
     fn bare() -> YtDlp {
-        YtDlp { bin: "yt-dlp".into(), js_runtime: None, cookies_from_browser: None }
+        YtDlp {
+            bin: "yt-dlp".into(),
+            js_runtime: None,
+            cookies_from_browser: None,
+        }
     }
 
     fn full() -> YtDlp {
-        YtDlp { js_runtime: Some("node".into()), cookies_from_browser: Some("brave".into()), ..bare() }
+        YtDlp {
+            js_runtime: Some("node".into()),
+            cookies_from_browser: Some("brave".into()),
+            ..bare()
+        }
     }
 
     fn strs(args: Vec<OsString>) -> Vec<String> {
@@ -176,7 +217,14 @@ mod tests {
     fn metadata_args_bare() {
         assert_eq!(
             strs(bare().metadata_args(URL)),
-            ["--no-warnings", "--no-progress", "-J", "--skip-download", "--no-playlist", URL]
+            [
+                "--no-warnings",
+                "--no-progress",
+                "-J",
+                "--skip-download",
+                "--no-playlist",
+                URL
+            ]
         );
     }
 
@@ -185,23 +233,49 @@ mod tests {
         assert_eq!(
             strs(full().metadata_args(URL)),
             [
-                "--no-warnings", "--no-progress", "--js-runtimes", "node", "--cookies-from-browser",
-                "brave", "-J", "--skip-download", "--no-playlist", URL,
+                "--no-warnings",
+                "--no-progress",
+                "--js-runtimes",
+                "node",
+                "--cookies-from-browser",
+                "brave",
+                "-J",
+                "--skip-download",
+                "--no-playlist",
+                URL,
             ]
         );
     }
 
     #[test]
     fn caption_args_request_exactly_one_track() {
-        let manual = CaptionTrack { code: "en".into(), kind: CaptionKind::Manual, language: "en".into() };
+        let manual = CaptionTrack {
+            code: "en".into(),
+            kind: CaptionKind::Manual,
+            language: "en".into(),
+        };
         assert_eq!(
             strs(bare().captions_args(URL, &manual, Path::new("/t/captions"))),
             [
-                "--no-warnings", "--no-progress", "--skip-download", "--write-subs", "--sub-langs", "en",
-                "--sub-format", "json3", "--no-playlist", "-o", "/t/captions", URL,
+                "--no-warnings",
+                "--no-progress",
+                "--skip-download",
+                "--write-subs",
+                "--sub-langs",
+                "en",
+                "--sub-format",
+                "json3",
+                "--no-playlist",
+                "-o",
+                "/t/captions",
+                URL,
             ]
         );
-        let auto = CaptionTrack { code: "hi-orig".into(), kind: CaptionKind::Auto, language: "hi".into() };
+        let auto = CaptionTrack {
+            code: "hi-orig".into(),
+            kind: CaptionKind::Auto,
+            language: "hi".into(),
+        };
         let a = strs(bare().captions_args(URL, &auto, Path::new("/t/captions")));
         assert!(a.contains(&"--write-auto-subs".to_string()));
         assert!(!a.contains(&"--write-subs".to_string()));
@@ -213,9 +287,19 @@ mod tests {
         assert_eq!(
             strs(bare().audio_args(URL, Path::new("/t/audio.%(ext)s"))),
             [
-                "--no-warnings", "--no-progress", "-f", "bestaudio/best", "-x", "--audio-format", "wav",
-                "--postprocessor-args", "ffmpeg:-ar 16000 -ac 1", "--no-playlist", "-o",
-                "/t/audio.%(ext)s", URL,
+                "--no-warnings",
+                "--no-progress",
+                "-f",
+                "bestaudio/best",
+                "-x",
+                "--audio-format",
+                "wav",
+                "--postprocessor-args",
+                "ffmpeg:-ar 16000 -ac 1",
+                "--no-playlist",
+                "-o",
+                "/t/audio.%(ext)s",
+                URL,
             ]
         );
     }
@@ -230,17 +314,28 @@ mod tests {
     }
 
     fn hi_orig() -> CaptionTrack {
-        CaptionTrack { code: "hi-orig".into(), kind: CaptionKind::Auto, language: "hi".into() }
+        CaptionTrack {
+            code: "hi-orig".into(),
+            kind: CaptionKind::Auto,
+            language: "hi".into(),
+        }
     }
 
     #[tokio::test]
     async fn exit_zero_without_a_caption_file_is_an_error_with_ytdlps_reason() {
         let tools = tempfile::tempdir().unwrap();
         let work = tempfile::tempdir().unwrap();
-        let y = fake_ytdlp(tools.path(), "echo 'There are no subtitles for the requested languages' >&2; exit 0");
+        let y = fake_ytdlp(
+            tools.path(),
+            "echo 'There are no subtitles for the requested languages' >&2; exit 0",
+        );
         let err = y.captions(URL, &hi_orig(), work.path()).await.unwrap_err();
         assert!(matches!(err, Error::Empty(_)), "{err:?}");
-        assert!(err.to_string().contains("no subtitles for the requested languages"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("no subtitles for the requested languages"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -271,15 +366,34 @@ mod tests {
                echo '{"events":[{"tStartMs":0,"dDurationMs":900,"segs":[{"utf8":"नमस्ते"}]}]}' > "$out.hi-orig.json3""#,
         );
         let segs = y.captions(URL, &hi_orig(), work.path()).await.unwrap();
-        assert_eq!(segs, vec![Segment { start_ms: 0, end_ms: 900, text: "नमस्ते".into() }]);
+        assert_eq!(
+            segs,
+            vec![Segment {
+                start_ms: 0,
+                end_ms: 900,
+                text: "नमस्ते".into()
+            }]
+        );
     }
 
     #[tokio::test]
     async fn invalid_utf8_metadata_is_a_parse_error_not_silent_mojibake() {
         let tools = tempfile::tempdir().unwrap();
-        let y = fake_ytdlp(tools.path(), r#"printf '{"id":"x","title":"\340\244","extractor_key":"Youtube"}'"#);
+        let y = fake_ytdlp(
+            tools.path(),
+            r#"printf '{"id":"x","title":"\340\244","extractor_key":"Youtube"}'"#,
+        );
         let err = y.metadata(URL).await.unwrap_err();
-        assert!(matches!(err, Error::Parse { what: "yt-dlp metadata", .. }), "{err:?}");
+        assert!(
+            matches!(
+                err,
+                Error::Parse {
+                    what: "yt-dlp metadata",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -288,6 +402,9 @@ mod tests {
         std::fs::write(dir.path().join("captions.en-de.json3"), "{}").unwrap();
         assert_eq!(caption_file(dir.path(), "en"), None);
         std::fs::write(dir.path().join("captions.en.json3"), "{}").unwrap();
-        assert_eq!(caption_file(dir.path(), "en"), Some(dir.path().join("captions.en.json3")));
+        assert_eq!(
+            caption_file(dir.path(), "en"),
+            Some(dir.path().join("captions.en.json3"))
+        );
     }
 }

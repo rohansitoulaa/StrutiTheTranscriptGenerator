@@ -28,8 +28,15 @@ async fn picks_the_rtx_4060_not_the_igpu() {
 #[ignore = "network"]
 async fn english_auto_captions() {
     // "How to think like a GENIUS UI/UX designer": language en-US, en-orig track.
-    let out = engine().await.transcribe("https://youtu.be/HE4rLEQpiXY").await.unwrap();
-    assert_eq!(out.transcript.source, TranscriptSource::Captions(CaptionKind::Auto));
+    let out = engine()
+        .await
+        .transcribe("https://youtu.be/HE4rLEQpiXY")
+        .await
+        .unwrap();
+    assert_eq!(
+        out.transcript.source,
+        TranscriptSource::Captions(CaptionKind::Auto)
+    );
     assert_eq!(out.transcript.language.as_deref(), Some("en"));
     assert!(out.transcript.text().split_whitespace().count() > 300);
 }
@@ -37,11 +44,22 @@ async fn english_auto_captions() {
 #[tokio::test]
 #[ignore = "network"]
 async fn hindi_auto_captions() {
-    let out = engine().await.transcribe("https://www.youtube.com/watch?v=hYQEXdm6FBQ").await.unwrap();
-    assert_eq!(out.transcript.source, TranscriptSource::Captions(CaptionKind::Auto));
+    let out = engine()
+        .await
+        .transcribe("https://www.youtube.com/watch?v=hYQEXdm6FBQ")
+        .await
+        .unwrap();
+    assert_eq!(
+        out.transcript.source,
+        TranscriptSource::Captions(CaptionKind::Auto)
+    );
     assert_eq!(out.transcript.language.as_deref(), Some("hi"));
     let text = out.transcript.text();
-    assert!(text.contains("दृश्यम"), "{}", text.chars().take(200).collect::<String>());
+    assert!(
+        text.contains("दृश्यम"),
+        "{}",
+        text.chars().take(200).collect::<String>()
+    );
     assert!(!text.contains("[संगीत]"));
 }
 
@@ -49,7 +67,11 @@ async fn hindi_auto_captions() {
 #[ignore = "network + GPU"]
 async fn whisper_path_when_language_is_unknown() {
     // "Me at the zoo" has no language field, so it goes through Whisper.
-    let out = engine().await.transcribe("https://www.youtube.com/watch?v=jNQXAC9IVRw").await.unwrap();
+    let out = engine()
+        .await
+        .transcribe("https://www.youtube.com/watch?v=jNQXAC9IVRw")
+        .await
+        .unwrap();
     assert_eq!(out.transcript.source, TranscriptSource::Whisper);
     assert_eq!(out.transcript.language.as_deref(), Some("en"));
     assert!(out.transcript.text().to_lowercase().contains("elephant"));

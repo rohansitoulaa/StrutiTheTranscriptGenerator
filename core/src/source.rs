@@ -7,13 +7,23 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// Regular videos, Shorts, live replays and embeds are all one video.
-    YouTubeVideo { id: String },
-    YouTubePlaylist { id: String },
+    YouTubeVideo {
+        id: String,
+    },
+    YouTubePlaylist {
+        id: String,
+    },
     /// Canonical channel URL (`/@handle`, `/channel/UC…`, `/c/…`, `/user/…`).
-    YouTubeChannel { url: String },
+    YouTubeChannel {
+        url: String,
+    },
     /// Reels, `/p/` posts and `/tv/` videos, keyed by shortcode.
-    InstagramReel { shortcode: String },
-    InstagramProfile { handle: String },
+    InstagramReel {
+        shortcode: String,
+    },
+    InstagramProfile {
+        handle: String,
+    },
 }
 
 impl Source {
@@ -47,7 +57,10 @@ impl Source {
     }
 
     pub fn is_single_video(&self) -> bool {
-        matches!(self, Source::YouTubeVideo { .. } | Source::InstagramReel { .. })
+        matches!(
+            self,
+            Source::YouTubeVideo { .. } | Source::InstagramReel { .. }
+        )
     }
 
     /// The form handed to yt-dlp: stripped of tracking params and playlist
@@ -57,7 +70,9 @@ impl Source {
             Source::YouTubeVideo { id } => format!("https://www.youtube.com/watch?v={id}"),
             Source::YouTubePlaylist { id } => format!("https://www.youtube.com/playlist?list={id}"),
             Source::YouTubeChannel { url } => url.clone(),
-            Source::InstagramReel { shortcode } => format!("https://www.instagram.com/reel/{shortcode}/"),
+            Source::InstagramReel { shortcode } => {
+                format!("https://www.instagram.com/reel/{shortcode}/")
+            }
             Source::InstagramProfile { handle } => format!("https://www.instagram.com/{handle}/"),
         }
     }
@@ -75,31 +90,43 @@ impl Source {
 }
 
 fn parse_youtube(url: &Url, segments: &[&str]) -> Option<Source> {
-    let query = |key: &str| url.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.into_owned());
+    let query = |key: &str| {
+        url.query_pairs()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.into_owned())
+    };
     match segments {
         ["watch", ..] => query("v").and_then(|id| video_id(&id)),
         ["shorts" | "live" | "embed", id, ..] => video_id(id),
         ["playlist", ..] => query("list")
             .filter(|id| is_id_chars(id))
             .map(|id| Source::YouTubePlaylist { id }),
-        [handle, ..] if handle.starts_with('@') && handle.len() > 1 => Some(Source::YouTubeChannel {
-            url: format!("https://www.youtube.com/{handle}"),
-        }),
-        [kind @ ("channel" | "c" | "user"), name, ..] if is_id_chars(name) => Some(Source::YouTubeChannel {
-            url: format!("https://www.youtube.com/{kind}/{name}"),
-        }),
+        [handle, ..] if handle.starts_with('@') && handle.len() > 1 => {
+            Some(Source::YouTubeChannel {
+                url: format!("https://www.youtube.com/{handle}"),
+            })
+        }
+        [kind @ ("channel" | "c" | "user"), name, ..] if is_id_chars(name) => {
+            Some(Source::YouTubeChannel {
+                url: format!("https://www.youtube.com/{kind}/{name}"),
+            })
+        }
         _ => None,
     }
 }
 
 fn parse_instagram(segments: &[&str]) -> Option<Source> {
-    let reel = |code: &str| is_id_chars(code).then(|| Source::InstagramReel { shortcode: code.to_string() });
+    let reel = |code: &str| {
+        is_id_chars(code).then(|| Source::InstagramReel {
+            shortcode: code.to_string(),
+        })
+    };
     match segments {
         ["reel" | "reels" | "p" | "tv", code, ..] => reel(code),
         [_handle, "reel" | "p", code, ..] => reel(code),
-        [handle] | [handle, "reels"] if is_handle(handle) => {
-            Some(Source::InstagramProfile { handle: handle.to_string() })
-        }
+        [handle] | [handle, "reels"] if is_handle(handle) => Some(Source::InstagramProfile {
+            handle: handle.to_string(),
+        }),
         _ => None,
     }
 }
@@ -110,18 +137,32 @@ fn video_id(id: &str) -> Option<Source> {
 }
 
 fn is_id_chars(s: &str) -> bool {
-    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Instagram top-level paths that are pages, not accounts.
 const INSTAGRAM_RESERVED: &[&str] = &[
-    "accounts", "direct", "explore", "reels", "reel", "p", "tv", "stories", "about", "legal", "developer",
-    "web", "api",
+    "accounts",
+    "direct",
+    "explore",
+    "reels",
+    "reel",
+    "p",
+    "tv",
+    "stories",
+    "about",
+    "legal",
+    "developer",
+    "web",
+    "api",
 ];
 
 fn is_handle(s: &str) -> bool {
     (1..=30).contains(&s.len())
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
         && !INSTAGRAM_RESERVED.contains(&s.to_ascii_lowercase().as_str())
 }
 
@@ -165,28 +206,51 @@ mod tests {
     fn youtube_playlist() {
         assert_eq!(
             Source::parse("https://www.youtube.com/playlist?list=PLabc_DEF-123").unwrap(),
-            Source::YouTubePlaylist { id: "PLabc_DEF-123".into() }
+            Source::YouTubePlaylist {
+                id: "PLabc_DEF-123".into()
+            }
         );
     }
 
     #[test]
     fn youtube_channels() {
         let cases = [
-            ("https://www.youtube.com/@kolejain", "https://www.youtube.com/@kolejain"),
-            ("https://www.youtube.com/@kolejain/videos", "https://www.youtube.com/@kolejain"),
-            ("https://youtube.com/@Movies24x7/shorts", "https://www.youtube.com/@Movies24x7"),
+            (
+                "https://www.youtube.com/@kolejain",
+                "https://www.youtube.com/@kolejain",
+            ),
+            (
+                "https://www.youtube.com/@kolejain/videos",
+                "https://www.youtube.com/@kolejain",
+            ),
+            (
+                "https://youtube.com/@Movies24x7/shorts",
+                "https://www.youtube.com/@Movies24x7",
+            ),
             (
                 "https://www.youtube.com/channel/UC6AhKCzMSkYl-46Ajx55gOA",
                 "https://www.youtube.com/channel/UC6AhKCzMSkYl-46Ajx55gOA",
             ),
-            ("https://www.youtube.com/c/SomeName", "https://www.youtube.com/c/SomeName"),
-            ("https://www.youtube.com/user/SomeName", "https://www.youtube.com/user/SomeName"),
+            (
+                "https://www.youtube.com/c/SomeName",
+                "https://www.youtube.com/c/SomeName",
+            ),
+            (
+                "https://www.youtube.com/user/SomeName",
+                "https://www.youtube.com/user/SomeName",
+            ),
             (
                 "https://www.youtube.com/channel/UC6AhKCzMSkYl-46Ajx55gOA/videos",
                 "https://www.youtube.com/channel/UC6AhKCzMSkYl-46Ajx55gOA",
             ),
-            ("https://www.youtube.com/c/SomeName/playlists", "https://www.youtube.com/c/SomeName"),
-            ("https://www.youtube.com/user/SomeName/about", "https://www.youtube.com/user/SomeName"),
+            (
+                "https://www.youtube.com/c/SomeName/playlists",
+                "https://www.youtube.com/c/SomeName",
+            ),
+            (
+                "https://www.youtube.com/user/SomeName/about",
+                "https://www.youtube.com/user/SomeName",
+            ),
         ];
         for (input, url) in cases {
             assert_eq!(
@@ -209,7 +273,9 @@ mod tests {
         ] {
             assert_eq!(
                 Source::parse(url).unwrap(),
-                Source::InstagramReel { shortcode: "DPx0yXkkS5M".into() },
+                Source::InstagramReel {
+                    shortcode: "DPx0yXkkS5M".into()
+                },
                 "{url}"
             );
         }
@@ -223,10 +289,16 @@ mod tests {
             "https://www.instagram.com/natgeo/reels/",
             "instagram.com/nat.geo_1",
         ] {
-            let handle = if url.contains("nat.geo_1") { "nat.geo_1" } else { "natgeo" };
+            let handle = if url.contains("nat.geo_1") {
+                "nat.geo_1"
+            } else {
+                "natgeo"
+            };
             assert_eq!(
                 Source::parse(url).unwrap(),
-                Source::InstagramProfile { handle: handle.into() },
+                Source::InstagramProfile {
+                    handle: handle.into()
+                },
                 "{url}"
             );
         }
@@ -247,7 +319,12 @@ mod tests {
 
     #[test]
     fn junk_is_rejected_with_the_input_in_the_error() {
-        for input in ["", "hello", "https://vimeo.com/123", "ftp://youtube.com/watch?v=jNQXAC9IVRw"] {
+        for input in [
+            "",
+            "hello",
+            "https://vimeo.com/123",
+            "ftp://youtube.com/watch?v=jNQXAC9IVRw",
+        ] {
             match Source::parse(input) {
                 Err(Error::UnsupportedUrl(s)) => assert_eq!(s, input.trim()),
                 other => panic!("{input:?} gave {other:?}"),
@@ -262,11 +339,17 @@ mod tests {
             "https://www.youtube.com/watch?v=jNQXAC9IVRw"
         );
         assert_eq!(
-            Source::InstagramReel { shortcode: "DPx0yXkkS5M".into() }.canonical_url(),
+            Source::InstagramReel {
+                shortcode: "DPx0yXkkS5M".into()
+            }
+            .canonical_url(),
             "https://www.instagram.com/reel/DPx0yXkkS5M/"
         );
         assert_eq!(
-            Source::InstagramProfile { handle: "natgeo".into() }.canonical_url(),
+            Source::InstagramProfile {
+                handle: "natgeo".into()
+            }
+            .canonical_url(),
             "https://www.instagram.com/natgeo/"
         );
         assert_eq!(
@@ -278,7 +361,12 @@ mod tests {
     #[test]
     fn single_video_vs_collections() {
         assert!(video("jNQXAC9IVRw").is_single_video());
-        assert!(Source::InstagramReel { shortcode: "x".into() }.is_single_video());
+        assert!(
+            Source::InstagramReel {
+                shortcode: "x".into()
+            }
+            .is_single_video()
+        );
         assert!(!Source::YouTubePlaylist { id: "x".into() }.is_single_video());
         assert!(!Source::YouTubeChannel { url: "x".into() }.is_single_video());
         assert!(!Source::InstagramProfile { handle: "x".into() }.is_single_video());

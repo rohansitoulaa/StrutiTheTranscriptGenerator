@@ -68,13 +68,21 @@ impl WhisperCli {
     /// Index of the first discrete (non-UMA) Vulkan GPU, found by running
     /// whisper-cli once on a second of silence and reading its device list.
     pub async fn detect_discrete_gpu(&self) -> Result<Option<u32>> {
-        let dir = tempfile::tempdir().map_err(fs_err("create a scratch folder in", std::env::temp_dir()))?;
+        let dir = tempfile::tempdir()
+            .map_err(fs_err("create a scratch folder in", std::env::temp_dir()))?;
         let wav = dir.path().join("silence.wav");
-        tokio::fs::write(&wav, silent_wav(1_000)).await.map_err(fs_err("write", &wav))?;
+        tokio::fs::write(&wav, silent_wav(1_000))
+            .await
+            .map_err(fs_err("write", &wav))?;
         // `-dl` exits right after language detection; device enumeration has
         // already been logged to stderr by then. No `-np`: it would hide it.
-        let args: Vec<OsString> =
-            vec!["-m".into(), self.model.clone().into(), "-f".into(), wav.into(), "-dl".into()];
+        let args: Vec<OsString> = vec![
+            "-m".into(),
+            self.model.clone().into(),
+            "-f".into(),
+            wav.into(),
+            "-dl".into(),
+        ];
         let out = run_tool("whisper-cli", &self.bin, &args, QUICK).await?;
         let stderr = String::from_utf8_lossy(&out.stderr);
         let device = pick_discrete_gpu(&stderr);
@@ -83,9 +91,14 @@ impl WhisperCli {
             // a changed ggml log format looks like, so say which one it was.
             let listed = stderr.lines().filter(|l| device_line(l).is_some()).count();
             if listed == 0 {
-                tracing::warn!("whisper-cli listed no Vulkan devices; transcription will use its default (CPU or iGPU) and be several times slower");
+                tracing::warn!(
+                    "whisper-cli listed no Vulkan devices; transcription will use its default (CPU or iGPU) and be several times slower"
+                );
             } else {
-                tracing::warn!(listed, "no discrete GPU among the Vulkan devices; using the default device, which is slower");
+                tracing::warn!(
+                    listed,
+                    "no discrete GPU among the Vulkan devices; using the default device, which is slower"
+                );
             }
             tracing::debug!(%stderr, "whisper-cli device probe output");
         }
@@ -95,12 +108,21 @@ impl WhisperCli {
 
 impl Transcriber for WhisperCli {
     async fn transcribe(&self, audio: &Path, language: Option<&str>) -> Result<Transcript> {
-        let dir = tempfile::tempdir().map_err(fs_err("create a scratch folder in", std::env::temp_dir()))?;
+        let dir = tempfile::tempdir()
+            .map_err(fs_err("create a scratch folder in", std::env::temp_dir()))?;
         let out_base = dir.path().join("whisper");
-        run_tool("whisper-cli", &self.bin, &self.args(audio, &out_base, language), LONG).await?;
+        run_tool(
+            "whisper-cli",
+            &self.bin,
+            &self.args(audio, &out_base, language),
+            LONG,
+        )
+        .await?;
 
         let json_path = out_base.with_extension("json");
-        let bytes = tokio::fs::read(&json_path).await.map_err(fs_err("read whisper output", &json_path))?;
+        let bytes = tokio::fs::read(&json_path)
+            .await
+            .map_err(fs_err("read whisper output", &json_path))?;
         let (detected, segments) = parse_whisper_json(&bytes)?;
         Ok(Transcript {
             source: TranscriptSource::Whisper,
@@ -139,8 +161,10 @@ struct Offsets {
 pub fn parse_whisper_json(bytes: &[u8]) -> Result<(Option<String>, Vec<Segment>)> {
     let text = String::from_utf8_lossy(bytes);
     let repaired = matches!(text, std::borrow::Cow::Owned(_));
-    let doc: WhisperJson = serde_json::from_str(&text)
-        .map_err(|e| Error::Parse { what: "whisper output", reason: e.to_string() })?;
+    let doc: WhisperJson = serde_json::from_str(&text).map_err(|e| Error::Parse {
+        what: "whisper output",
+        reason: e.to_string(),
+    })?;
 
     let mut dropped_fragments = 0;
     let segments = doc
@@ -153,16 +177,29 @@ pub fn parse_whisper_json(bytes: &[u8]) -> Result<(Option<String>, Vec<Segment>)
             let without_fragments = s.text.replace('\u{FFFD}', "");
             // `[BLANK_AUDIO]` and similar are whisper's non-speech markers.
             let text = strip_annotations(&without_fragments);
-            (!text.is_empty()).then_some(Segment { start_ms: s.offsets.from, end_ms: s.offsets.to, text })
+            (!text.is_empty()).then_some(Segment {
+                start_ms: s.offsets.from,
+                end_ms: s.offsets.to,
+                text,
+            })
         })
         .collect();
     if repaired {
-        tracing::warn!(dropped_fragments, "whisper output had invalid UTF-8; broken characters were dropped");
+        tracing::warn!(
+            dropped_fragments,
+            "whisper output had invalid UTF-8; broken characters were dropped"
+        );
     }
-    let reported = doc.result.and_then(|r| r.language).filter(|l| !l.is_empty());
+    let reported = doc
+        .result
+        .and_then(|r| r.language)
+        .filter(|l| !l.is_empty());
     let language = reported.as_deref().and_then(language_tag);
     if let (Some(raw), None) = (&reported, &language) {
-        tracing::warn!(language = raw.as_str(), "whisper reported an unrecognised language code, ignoring it");
+        tracing::warn!(
+            language = raw.as_str(),
+            "whisper reported an unrecognised language code, ignoring it"
+        );
     }
     Ok((language, segments))
 }
@@ -264,13 +301,26 @@ mod tests {
             {"offsets":{"from":0,"to":1000},"text":" [BLANK_AUDIO]"},
             {"offsets":{"from":1000,"to":2000},"text":" Hello."}]}"#;
         let (_, segs) = parse_whisper_json(json).unwrap();
-        assert_eq!(segs, vec![Segment { start_ms: 1000, end_ms: 2000, text: "Hello.".into() }]);
+        assert_eq!(
+            segs,
+            vec![Segment {
+                start_ms: 1000,
+                end_ms: 2000,
+                text: "Hello.".into()
+            }]
+        );
     }
 
     #[test]
     fn rejects_output_without_transcription() {
-        assert!(matches!(parse_whisper_json(b"{}"), Err(Error::Parse { .. })));
-        assert!(matches!(parse_whisper_json(b"nope"), Err(Error::Parse { .. })));
+        assert!(matches!(
+            parse_whisper_json(b"{}"),
+            Err(Error::Parse { .. })
+        ));
+        assert!(matches!(
+            parse_whisper_json(b"nope"),
+            Err(Error::Parse { .. })
+        ));
     }
 
     #[test]
@@ -284,7 +334,10 @@ mod tests {
             ggml_vulkan: 0 = Intel(R) Arc(tm) Graphics (MTL) | uma: 1 | fp16: 1";
         assert_eq!(pick_discrete_gpu(igpu_only), None);
         assert_eq!(pick_discrete_gpu(""), None);
-        assert_eq!(pick_discrete_gpu("ggml_vulkan: 0 = NVIDIA X | uma: 0 | fp16: 1"), Some(0));
+        assert_eq!(
+            pick_discrete_gpu("ggml_vulkan: 0 = NVIDIA X | uma: 0 | fp16: 1"),
+            Some(0)
+        );
     }
 
     #[test]
@@ -292,7 +345,19 @@ mod tests {
         let a = strs(cli().args(Path::new("/a/in.wav"), Path::new("/t/out"), None));
         assert_eq!(
             a,
-            ["-m", "/m/model.bin", "-f", "/a/in.wav", "-l", "auto", "-oj", "-of", "/t/out", "-np", "-nf"]
+            [
+                "-m",
+                "/m/model.bin",
+                "-f",
+                "/a/in.wav",
+                "-l",
+                "auto",
+                "-oj",
+                "-of",
+                "/t/out",
+                "-np",
+                "-nf"
+            ]
         );
     }
 
@@ -308,8 +373,24 @@ mod tests {
         assert_eq!(
             a,
             [
-                "-m", "/m/model.bin", "-f", "/a/in.wav", "-l", "hi", "-oj", "-of", "/t/out", "-np", "-nf",
-                "--vad", "--vad-model", "/m/vad.bin", "-dev", "1", "-t", "8",
+                "-m",
+                "/m/model.bin",
+                "-f",
+                "/a/in.wav",
+                "-l",
+                "hi",
+                "-oj",
+                "-of",
+                "/t/out",
+                "-np",
+                "-nf",
+                "--vad",
+                "--vad-model",
+                "/m/vad.bin",
+                "-dev",
+                "1",
+                "-t",
+                "8",
             ]
         );
     }
