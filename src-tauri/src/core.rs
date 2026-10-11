@@ -103,8 +103,7 @@ pub fn paths() -> Paths {
     }
 }
 
-/// Repo root in development; packaging (build step 6) points the tool
-/// paths elsewhere.
+/// The repo checkout this was built from: tools and models for debug builds.
 pub fn repo_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -134,7 +133,18 @@ pub fn out_dir(settings: &Settings, paths: &Paths) -> Result<PathBuf, String> {
 /// The effective configuration for `settings`, with Shruti's own yt-dlp
 /// once it has one (YT-3), unless `SHRUTI_YTDLP` says otherwise.
 pub fn config_for(settings: &Settings, paths: &Paths) -> Result<Config, String> {
-    let mut config = Config::load(repo_root(), settings, env).map_err(|e| e.to_string())?;
+    let user = env("USER").unwrap_or_default();
+    let defaults = if cfg!(debug_assertions) {
+        Config::defaults(repo_root(), &paths.home, &user)
+    } else {
+        // Installed: the bundled tools sit next to the executable.
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .unwrap_or_default();
+        Config::packaged(&exe_dir, &paths.data_dir, &paths.home, &user)
+    };
+    let mut config = Config::load_over(defaults, settings, env).map_err(|e| e.to_string())?;
     let managed = tools::managed_ytdlp(&paths.data_dir);
     if env("SHRUTI_YTDLP").is_none() && managed.is_file() {
         config.ytdlp_bin = managed;

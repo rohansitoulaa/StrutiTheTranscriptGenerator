@@ -106,7 +106,21 @@ impl Config {
         }
     }
 
-    /// Defaults, then `settings`, then `SHRUTI_*` variables.
+    /// Defaults for the installed app: the bundled tools sit next to its
+    /// executable (`shruti-whisper-cli`, `shruti-yt-dlp`), and the models
+    /// are downloaded into `data_dir` on first launch (PDA UI-7).
+    pub fn packaged(exe_dir: &Path, data_dir: &Path, home: &Path, user: &str) -> Self {
+        let models = data_dir.join("models");
+        Config {
+            ytdlp_bin: exe_dir.join("shruti-yt-dlp"),
+            whisper_bin: exe_dir.join("shruti-whisper-cli"),
+            whisper_model: models.join("ggml-large-v3-turbo-q5_0.bin"),
+            vad_model: Some(models.join("ggml-silero-v5.1.2.bin")),
+            ..Config::defaults(exe_dir, home, user)
+        }
+    }
+
+    /// Repo defaults, then `settings`, then `SHRUTI_*` variables.
     pub fn load(
         repo_root: &Path,
         settings: &Settings,
@@ -114,10 +128,18 @@ impl Config {
     ) -> Result<Self> {
         let home = PathBuf::from(var("HOME").unwrap_or_default());
         let user = var("USER").unwrap_or_default();
-        let mut c = Config::defaults(repo_root, &home, &user);
-        c.apply_settings(settings)?;
-        c.apply_env(&var)?;
-        Ok(c)
+        Config::load_over(Config::defaults(repo_root, &home, &user), settings, var)
+    }
+
+    /// `defaults`, then `settings`, then `SHRUTI_*` variables.
+    pub fn load_over(
+        mut defaults: Config,
+        settings: &Settings,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self> {
+        defaults.apply_settings(settings)?;
+        defaults.apply_env(&var)?;
+        Ok(defaults)
     }
 
     fn apply_settings(&mut self, s: &Settings) -> Result<()> {
@@ -492,6 +514,30 @@ mod tests {
             ..Settings::default()
         };
         assert!(Config::load(Path::new("/repo"), &bad, env(&[])).is_err());
+    }
+
+    #[test]
+    fn the_installed_app_uses_its_bundled_tools_and_downloaded_models() {
+        let c = Config::packaged(
+            Path::new("/usr/bin"),
+            Path::new("/home/me/.local/share/shruti"),
+            Path::new("/home/me"),
+            "me",
+        );
+        assert_eq!(c.whisper_bin, PathBuf::from("/usr/bin/shruti-whisper-cli"));
+        assert_eq!(c.ytdlp_bin, PathBuf::from("/usr/bin/shruti-yt-dlp"));
+        assert_eq!(
+            c.whisper_model,
+            PathBuf::from("/home/me/.local/share/shruti/models/ggml-large-v3-turbo-q5_0.bin")
+        );
+        assert_eq!(c.work_dir, PathBuf::from("/home/me/.cache/shruti/work"));
+        let settings = Settings {
+            whisper_model: Some("/big/model.bin".into()),
+            ..Settings::default()
+        };
+        let c = Config::load_over(c, &settings, env(&[("SHRUTI_YTDLP", "/opt/yt-dlp")])).unwrap();
+        assert_eq!(c.whisper_model, PathBuf::from("/big/model.bin"));
+        assert_eq!(c.ytdlp_bin, PathBuf::from("/opt/yt-dlp"));
     }
 
     #[test]
