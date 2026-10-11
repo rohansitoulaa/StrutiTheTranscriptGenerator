@@ -7,11 +7,13 @@
 
 pub mod captions;
 pub mod config;
+pub mod db;
 pub mod error;
 pub mod metadata;
 pub mod output;
 pub mod pipeline;
 mod process;
+pub mod queue;
 pub mod source;
 pub mod transcript;
 pub mod whisper;

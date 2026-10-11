@@ -8,6 +8,7 @@ use crate::captions::parse_json3;
 use crate::error::{fs_err, stderr_tail};
 use crate::metadata::{CaptionKind, CaptionTrack, VideoMeta};
 use crate::process::{LONG, QUICK, run_tool};
+use crate::source::Source;
 use crate::transcript::Segment;
 use crate::{Error, Result};
 
@@ -23,7 +24,9 @@ pub trait Fetcher {
         dir: &Path,
     ) -> impl Future<Output = Result<Vec<Segment>>> + Send;
 
-    /// Downloads audio as 16 kHz mono WAV into `dir` and returns its path.
+    /// Downloads audio as 16 kHz mono WAV to `dir/`[`AUDIO_FILE`] and
+    /// returns that path. The fixed name lets the queue find it again after
+    /// a restart.
     fn audio(&self, url: &str, dir: &Path) -> impl Future<Output = Result<PathBuf>> + Send;
 }
 
@@ -33,27 +36,32 @@ pub struct YtDlp {
     /// YouTube now needs a JS runtime for its signature challenges; without
     /// one, audio formats go missing. Node is already on this machine.
     pub js_runtime: Option<String>,
-    /// Browser to read cookies from (PDA IG-2). Instagram needs it.
+    /// Browser to read cookies from, for Instagram only (PDA IG-2).
+    /// YouTube rejects a logged-in browser session's cookies with "The page
+    /// needs to be reloaded", so they're never sent there.
     pub cookies_from_browser: Option<String>,
 }
 
 const CAPTION_STEM: &str = "captions";
 const AUDIO_STEM: &str = "audio";
+pub const AUDIO_FILE: &str = "audio.wav";
 
 impl YtDlp {
-    fn base_args(&self) -> Vec<OsString> {
+    fn base_args(&self, url: &str) -> Vec<OsString> {
         let mut args: Vec<OsString> = vec!["--no-warnings".into(), "--no-progress".into()];
         if let Some(rt) = &self.js_runtime {
             args.extend(["--js-runtimes".into(), rt.into()]);
         }
-        if let Some(browser) = &self.cookies_from_browser {
+        if let Some(browser) = &self.cookies_from_browser
+            && is_instagram(url)
+        {
             args.extend(["--cookies-from-browser".into(), browser.into()]);
         }
         args
     }
 
     pub fn metadata_args(&self, url: &str) -> Vec<OsString> {
-        let mut args = self.base_args();
+        let mut args = self.base_args(url);
         args.extend([
             "-J".into(),
             "--skip-download".into(),
@@ -75,7 +83,7 @@ impl YtDlp {
             CaptionKind::Manual => "--write-subs",
             CaptionKind::Auto => "--write-auto-subs",
         };
-        let mut args = self.base_args();
+        let mut args = self.base_args(url);
         args.extend([
             "--skip-download".into(),
             write.into(),
@@ -92,7 +100,7 @@ impl YtDlp {
     }
 
     pub fn audio_args(&self, url: &str, out_template: &Path) -> Vec<OsString> {
-        let mut args = self.base_args();
+        let mut args = self.base_args(url);
         args.extend([
             "-f".into(),
             "bestaudio/best".into(),
@@ -146,7 +154,7 @@ impl Fetcher for YtDlp {
     async fn audio(&self, url: &str, dir: &Path) -> Result<PathBuf> {
         let template = dir.join(format!("{AUDIO_STEM}.%(ext)s"));
         let out = run_tool("yt-dlp", &self.bin, &self.audio_args(url, &template), LONG).await?;
-        let wav = dir.join(format!("{AUDIO_STEM}.wav"));
+        let wav = dir.join(AUDIO_FILE);
         let size = match tokio::fs::metadata(&wav).await {
             Ok(m) => m.len(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -178,6 +186,13 @@ fn with_stderr(msg: String, stderr: &[u8]) -> String {
     } else {
         format!("{msg}: {tail}")
     }
+}
+
+fn is_instagram(url: &str) -> bool {
+    matches!(
+        Source::parse(url),
+        Ok(Source::InstagramReel { .. } | Source::InstagramProfile { .. })
+    )
 }
 
 /// yt-dlp names subtitle files `<stem>.<code>.<ext>`.
@@ -229,9 +244,10 @@ mod tests {
     }
 
     #[test]
-    fn metadata_args_with_runtime_and_cookies() {
+    fn cookies_go_to_instagram_only() {
+        const REEL: &str = "https://www.instagram.com/reel/DboSoFGP5Hw/";
         assert_eq!(
-            strs(full().metadata_args(URL)),
+            strs(full().metadata_args(REEL)),
             [
                 "--no-warnings",
                 "--no-progress",
@@ -242,9 +258,18 @@ mod tests {
                 "-J",
                 "--skip-download",
                 "--no-playlist",
-                URL,
+                REEL,
             ]
         );
+        // Measured: YouTube fails with a browser session's cookies.
+        let youtube = strs(full().metadata_args(URL));
+        assert!(
+            !youtube.contains(&"--cookies-from-browser".to_string()),
+            "{youtube:?}"
+        );
+        assert!(youtube.contains(&"--js-runtimes".to_string()));
+        let audio = strs(full().audio_args(URL, Path::new("/t/audio.%(ext)s")));
+        assert!(!audio.contains(&"--cookies-from-browser".to_string()));
     }
 
     #[test]

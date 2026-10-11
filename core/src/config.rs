@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::pipeline::Engine;
+use crate::queue::Limits;
 use crate::whisper::WhisperCli;
 use crate::ytdlp::YtDlp;
 use crate::{Error, Result};
@@ -25,12 +26,17 @@ pub struct Config {
     pub vad_model: Option<PathBuf>,
     pub gpu: GpuChoice,
     pub threads: Option<u32>,
+    pub database_url: String,
+    /// Audio waiting between the download and Whisper stages.
+    pub work_dir: PathBuf,
+    pub limits: Limits,
 }
 
 impl Config {
     /// Defaults for a checkout of this repo: whisper-cli built under
-    /// `vendor/`, models under `models/`, yt-dlp and node from `PATH`.
-    pub fn repo_defaults(repo_root: &Path) -> Self {
+    /// `vendor/`, models under `models/`, yt-dlp and node from `PATH`, the
+    /// local Postgres `shruti` database over its Unix socket as `user`.
+    pub fn defaults(repo_root: &Path, home: &Path, user: &str) -> Self {
         Config {
             ytdlp_bin: "yt-dlp".into(),
             js_runtime: Some("node".into()),
@@ -40,13 +46,18 @@ impl Config {
             vad_model: Some(repo_root.join("models/ggml-silero-v5.1.2.bin")),
             gpu: GpuChoice::Auto,
             threads: None,
+            database_url: local_database_url(user, "shruti"),
+            work_dir: home.join(".cache/shruti/work"),
+            limits: Limits::default(),
         }
     }
 
-    /// [`Config::repo_defaults`] overridden by `SHRUTI_*` variables. An empty
-    /// value turns an optional setting off.
+    /// [`Config::defaults`] (with `HOME` and `USER`) overridden by
+    /// `SHRUTI_*` variables. An empty value turns an optional setting off.
     pub fn from_env(repo_root: &Path, var: impl Fn(&str) -> Option<String>) -> Result<Self> {
-        let mut c = Config::repo_defaults(repo_root);
+        let home = PathBuf::from(var("HOME").unwrap_or_default());
+        let user = var("USER").unwrap_or_default();
+        let mut c = Config::defaults(repo_root, &home, &user);
         let optional = |v: String| (!v.is_empty()).then_some(v);
         let number = |name: &'static str, v: &str| {
             v.parse::<u32>().map_err(|_| Error::Parse {
@@ -78,6 +89,15 @@ impl Config {
                 "" | "auto" => GpuChoice::Auto,
                 n => GpuChoice::Device(number("SHRUTI_GPU", n)?),
             };
+        }
+        if let Some(v) = var("SHRUTI_DATABASE_URL").filter(|v| !v.is_empty()) {
+            c.database_url = v;
+        }
+        if let Some(v) = var("SHRUTI_WORK_DIR").filter(|v| !v.is_empty()) {
+            c.work_dir = v.into();
+        }
+        if let Some(v) = var("SHRUTI_DOWNLOADS").filter(|v| !v.is_empty()) {
+            c.limits.downloads = number("SHRUTI_DOWNLOADS", &v)?.max(1) as usize;
         }
         if let Some(v) = var("SHRUTI_THREADS") {
             c.threads = if v.is_empty() {
@@ -141,6 +161,12 @@ impl Config {
     }
 }
 
+/// The local server over its Unix socket, as `user` (peer authentication,
+/// no password). sqlx needs the socket path percent-encoded as the host.
+pub fn local_database_url(user: &str, database: &str) -> String {
+    format!("postgres://{user}@%2Fvar%2Frun%2Fpostgresql/{database}")
+}
+
 fn program_exists(bin: &Path) -> bool {
     if bin.components().count() > 1 {
         return bin.is_file();
@@ -155,6 +181,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::collections::HashMap;
 
+    fn defaults() -> Config {
+        Config::defaults(Path::new("/repo"), Path::new("/home/me"), "me")
+    }
+
     fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs
             .iter()
@@ -165,7 +195,7 @@ mod tests {
 
     #[test]
     fn repo_defaults_point_into_the_checkout() {
-        let c = Config::repo_defaults(Path::new("/repo"));
+        let c = defaults();
         assert_eq!(c.ytdlp_bin, PathBuf::from("yt-dlp"));
         assert_eq!(c.js_runtime.as_deref(), Some("node"));
         assert_eq!(c.cookies_from_browser, None);
@@ -183,6 +213,12 @@ mod tests {
         );
         assert_eq!(c.gpu, GpuChoice::Auto);
         assert_eq!(c.threads, None);
+        assert_eq!(
+            c.database_url,
+            "postgres://me@%2Fvar%2Frun%2Fpostgresql/shruti"
+        );
+        assert_eq!(c.work_dir, PathBuf::from("/home/me/.cache/shruti/work"));
+        assert_eq!(c.limits.downloads, 3);
     }
 
     #[test]
@@ -198,6 +234,9 @@ mod tests {
                 ("SHRUTI_VAD_MODEL", ""),
                 ("SHRUTI_GPU", "1"),
                 ("SHRUTI_THREADS", "8"),
+                ("SHRUTI_DATABASE_URL", "postgres://x@db/other"),
+                ("SHRUTI_WORK_DIR", "/fast/work"),
+                ("SHRUTI_DOWNLOADS", "2"),
             ]),
         )
         .unwrap();
@@ -209,13 +248,20 @@ mod tests {
         assert_eq!(c.vad_model, None);
         assert_eq!(c.gpu, GpuChoice::Device(1));
         assert_eq!(c.threads, Some(8));
+        assert_eq!(c.database_url, "postgres://x@db/other");
+        assert_eq!(c.work_dir, PathBuf::from("/fast/work"));
+        assert_eq!(c.limits.downloads, 2);
     }
 
     #[test]
     fn no_env_is_repo_defaults() {
         assert_eq!(
-            Config::from_env(Path::new("/repo"), env(&[])).unwrap(),
-            Config::repo_defaults(Path::new("/repo"))
+            Config::from_env(
+                Path::new("/repo"),
+                env(&[("HOME", "/home/me"), ("USER", "me")])
+            )
+            .unwrap(),
+            defaults()
         );
         let c = Config::from_env(Path::new("/repo"), env(&[("SHRUTI_GPU", "auto")])).unwrap();
         assert_eq!(c.gpu, GpuChoice::Auto);
@@ -223,7 +269,11 @@ mod tests {
 
     #[test]
     fn bad_numbers_name_the_variable() {
-        for (k, v) in [("SHRUTI_GPU", "nvidia"), ("SHRUTI_THREADS", "-2")] {
+        for (k, v) in [
+            ("SHRUTI_GPU", "nvidia"),
+            ("SHRUTI_THREADS", "-2"),
+            ("SHRUTI_DOWNLOADS", "many"),
+        ] {
             let err = Config::from_env(Path::new("/repo"), env(&[(k, v)])).unwrap_err();
             assert!(err.to_string().contains(k), "{err}");
         }
@@ -234,7 +284,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = Config {
             ytdlp_bin: "sh".into(),
-            ..Config::repo_defaults(dir.path())
+            ..Config::defaults(dir.path(), dir.path(), "me")
         };
         let problems = c.problems();
         assert_eq!(problems.len(), 3, "{problems:?}");
@@ -247,7 +297,7 @@ mod tests {
         let c = Config {
             vad_model: None,
             ytdlp_bin: "sh".into(),
-            ..Config::repo_defaults(dir.path())
+            ..Config::defaults(dir.path(), dir.path(), "me")
         };
         assert_eq!(c.problems().len(), 1);
     }
@@ -255,7 +305,7 @@ mod tests {
     #[test]
     fn programs_are_found_on_path_or_reported() {
         let dir = tempfile::tempdir().unwrap();
-        let base = Config::repo_defaults(dir.path());
+        let base = Config::defaults(dir.path(), dir.path(), "me");
         let on_path = Config {
             whisper_bin: "sh".into(),
             ytdlp_bin: "sh".into(),

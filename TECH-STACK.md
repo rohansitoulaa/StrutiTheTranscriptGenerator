@@ -213,6 +213,9 @@ yt-dlp --js-runtimes node -f bestaudio/best -x --audio-format wav \
   on. `-dev N` is required (see GPU below).
 - **whisper JSON can contain invalid UTF-8** (Devanagari split across tokens),
   so it's decoded lossily.
+- **Browser cookies go to Instagram only.** YouTube answers a logged-in
+  browser session's cookies with "The page needs to be reloaded" (measured
+  in step 2), so `--cookies-from-browser` is never passed for YouTube URLs.
 
 Tauri bundles these via `externalBin` in `tauri.conf.json`, with each file named
 using its target triple suffix (e.g. `yt-dlp-x86_64-unknown-linux-gnu`).
@@ -314,6 +317,26 @@ Models live in `models/` (gitignored): `ggml-large-v3-turbo-q5_0.bin` and
 
 ---
 
+## Postgres (step 2)
+
+- **Connection:** the local server over its Unix socket, as your OS user
+  (peer authentication, no password). sqlx 0.9 rejects an empty host and
+  doesn't default the user, so the URL is
+  `postgres://<user>@%2Fvar%2Frun%2Fpostgresql/shruti`. Override with
+  `SHRUTI_DATABASE_URL`.
+- **Schema:** `videos` (keyed `platform:id`, with caption track codes so a
+  restart doesn't re-ask yt-dlp), `transcripts` (insert-only: raw text,
+  timed segments as jsonb, caption fallback reason), `jobs` (`stage` = next
+  stage to run, `status`, `reason`, one open job per video via a partial
+  unique index). Migrations run on startup and are additive only.
+- **Queue:** a dispatcher claims jobs with `FOR UPDATE SKIP LOCKED` and runs
+  each through metadata → fetch → transcribe → clean → file → write.
+  Downloads (3) and Whisper (1) have separate semaphores, so a download
+  overlaps a transcription. Audio waits in `~/.cache/shruti/work/<key>/`
+  between fetch and transcribe so a restart doesn't re-download it.
+- **Tests:** `#[sqlx::test]` creates a throwaway database per test, using
+  `DATABASE_URL` from `.cargo/config.toml` (the `shruti_test` base database).
+
 ## Project layout
 
 ```
@@ -326,10 +349,13 @@ shruti/
 │   │   ├── captions.rs           # json3 → segments
 │   │   ├── ytdlp.rs              # Fetcher trait + yt-dlp
 │   │   ├── whisper.rs            # Transcriber trait + whisper-cli, GPU probe
-│   │   ├── pipeline.rs           # captions-or-whisper orchestration
+│   │   ├── pipeline.rs           # stages: metadata, fetch (captions or audio), transcribe
+│   │   ├── db.rs                 # Postgres: videos, insert-only transcripts, jobs
+│   │   ├── queue.rs              # resumable staged queue, download/whisper limits
 │   │   ├── output.rs             # note filename, frontmatter, never-overwrite write
 │   │   ├── config.rs             # SHRUTI_* env + repo defaults
 │   │   └── bin/shruti.rs         # dev CLI: shruti [--out DIR] <link>…
+│   ├── migrations/               # sqlx migrations (additive only)
 │   └── tests/                    # fixtures from real yt-dlp/whisper output, live.rs (ignored)
 ├── vendor/                       # whisper.cpp + SPIRV-Headers sources (gitignored)
 ├── models/                       # Whisper + VAD models (gitignored)
@@ -392,8 +418,9 @@ doesn't.
 1. ✅ **Rust core, no UI.** URL → transcript file, driven by a test. Prove yt-dlp
    captions, the ffmpeg conversion, and whisper all work on this machine.
    (Done 2026-10-11: `core/`, 72 unit tests + 4 live tests.)
-2. **Postgres + the worker pool.** Resumability and the
-   download/transcribe/cleanup overlap.
+2. ✅ **Postgres + the worker pool.** Resumability and the
+   download/transcribe/cleanup overlap. (Done 2026-10-11: `db.rs`,
+   `queue.rs`, migration `0001_init.sql`.)
 2b. **LLM cleanup stage.** Prompt, chunking, length guardrail, re-clean.
 3. **Channel and profile expansion.** The part most likely to be fiddly.
 4. **UI over the working core.** Queue table, live progress, transcript viewer.

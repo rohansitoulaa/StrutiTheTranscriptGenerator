@@ -2,7 +2,7 @@
 
 use crate::metadata::CaptionKind;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Segment {
     pub start_ms: u64,
     pub end_ms: u64,

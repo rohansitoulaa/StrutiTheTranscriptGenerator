@@ -1,7 +1,7 @@
 //! One link → one raw transcript: captions when the video has them in its
 //! spoken language, otherwise audio → Whisper (PDA §3, TR-1, TR-2).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::fs_err;
 use crate::metadata::{CaptionTrack, VideoMeta};
@@ -10,6 +10,16 @@ use crate::transcript::{Transcript, TranscriptSource};
 use crate::whisper::Transcriber;
 use crate::ytdlp::Fetcher;
 use crate::{Error, Result};
+
+/// The canonical URL of a single-video link. Collections are expanded
+/// elsewhere (build step 3).
+pub fn single_video_url(input: &str) -> Result<String> {
+    let source = Source::parse(input)?;
+    if !source.is_single_video() {
+        return Err(Error::NotYetSupported(source.kind()));
+    }
+    Ok(source.canonical_url())
+}
 
 pub struct Engine<F, T> {
     pub fetcher: F,
@@ -25,39 +35,69 @@ pub struct Outcome {
     pub caption_error: Option<String>,
 }
 
+/// What the fetch stage produced.
+#[derive(Debug)]
+pub enum Fetched {
+    /// Usable captions: the transcript is ready, no audio needed.
+    Captions(Transcript),
+    /// Audio for Whisper, plus why captions weren't used when a track existed.
+    Audio {
+        path: PathBuf,
+        caption_error: Option<String>,
+    },
+}
+
 impl<F: Fetcher + Sync, T: Transcriber + Sync> Engine<F, T> {
+    /// One link start to finish, for the CLI. The queue runs the same stages
+    /// one at a time so it can resume between them.
     pub async fn transcribe(&self, input: &str) -> Result<Outcome> {
-        let source = Source::parse(input)?;
-        if !source.is_single_video() {
-            // Expansion of channels, playlists and profiles is build step 3.
-            return Err(Error::NotYetSupported(source.kind()));
-        }
-        let url = source.canonical_url();
-        let meta = self.fetcher.metadata(&url).await?;
+        let url = single_video_url(input)?;
+        let meta = self.metadata(&url).await?;
         let work = tempfile::tempdir()
             .map_err(fs_err("create a scratch folder in", std::env::temp_dir()))?;
+        let (transcript, caption_error) = match self.fetch(&meta, &url, work.path()).await? {
+            Fetched::Captions(transcript) => (transcript, None),
+            Fetched::Audio {
+                path,
+                caption_error,
+            } => (self.transcribe_audio(&meta, &path).await?, caption_error),
+        };
+        Ok(Outcome {
+            meta,
+            transcript,
+            caption_error,
+        })
+    }
 
+    pub async fn metadata(&self, url: &str) -> Result<VideoMeta> {
+        self.fetcher.metadata(url).await
+    }
+
+    /// Captions when the video has a usable track in its spoken language,
+    /// otherwise audio downloaded into `dir`.
+    pub async fn fetch(&self, meta: &VideoMeta, url: &str, dir: &Path) -> Result<Fetched> {
         let caption_error = match meta.pick_caption() {
             None => None,
-            Some(track) => match self.captions(&url, track, work.path()).await {
-                Ok(transcript) => {
-                    return Ok(Outcome {
-                        meta,
-                        transcript,
-                        caption_error: None,
-                    });
-                }
+            Some(track) => match self.captions(url, track, dir).await {
+                Ok(transcript) => return Ok(Fetched::Captions(transcript)),
                 Err(reason) => {
                     tracing::warn!(key = %meta.key(), %reason, "captions unusable, using whisper");
                     Some(reason)
                 }
             },
         };
+        let path = self.fetcher.audio(url, dir).await?;
+        Ok(Fetched::Audio {
+            path,
+            caption_error,
+        })
+    }
 
-        let audio = self.fetcher.audio(&url, work.path()).await?;
+    /// Whisper on downloaded audio. Silence is an error, not an empty note.
+    pub async fn transcribe_audio(&self, meta: &VideoMeta, audio: &Path) -> Result<Transcript> {
         let transcript = self
             .transcriber
-            .transcribe(&audio, meta.spoken_language().as_deref())
+            .transcribe(audio, meta.spoken_language().as_deref())
             .await?;
         if transcript.is_empty() {
             return Err(Error::Empty(format!(
@@ -65,11 +105,7 @@ impl<F: Fetcher + Sync, T: Transcriber + Sync> Engine<F, T> {
                 meta.key()
             )));
         }
-        Ok(Outcome {
-            meta,
-            transcript,
-            caption_error,
-        })
+        Ok(transcript)
     }
 
     /// The caption track as a transcript, or why it can't be used.
@@ -101,7 +137,6 @@ mod tests {
     use crate::metadata::{CaptionKind, Platform};
     use crate::transcript::Segment;
     use pretty_assertions::assert_eq;
-    use std::path::PathBuf;
     use std::sync::Mutex;
 
     #[derive(Default)]

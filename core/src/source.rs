@@ -77,6 +77,17 @@ impl Source {
         }
     }
 
+    /// The dedupe key (`platform:id`, PDA DB-2) for a single video, known
+    /// from the link alone. Matches `VideoMeta::key` because yt-dlp uses the
+    /// same ids (YouTube video id, Instagram shortcode).
+    pub fn video_key(&self) -> Option<String> {
+        match self {
+            Source::YouTubeVideo { id } => Some(format!("youtube:{id}")),
+            Source::InstagramReel { shortcode } => Some(format!("instagram:{shortcode}")),
+            _ => None,
+        }
+    }
+
     /// Short label for errors like "channel links are not supported yet".
     pub fn kind(&self) -> &'static str {
         match self {
@@ -355,6 +366,26 @@ mod tests {
         assert_eq!(
             Source::YouTubePlaylist { id: "PL1".into() }.canonical_url(),
             "https://www.youtube.com/playlist?list=PL1"
+        );
+    }
+
+    #[test]
+    fn video_keys_match_metadata_keys() {
+        assert_eq!(
+            video("jNQXAC9IVRw").video_key().as_deref(),
+            Some("youtube:jNQXAC9IVRw")
+        );
+        assert_eq!(
+            Source::InstagramReel {
+                shortcode: "DboSoFGP5Hw".into()
+            }
+            .video_key()
+            .as_deref(),
+            Some("instagram:DboSoFGP5Hw")
+        );
+        assert_eq!(
+            Source::InstagramProfile { handle: "x".into() }.video_key(),
+            None
         );
     }
 

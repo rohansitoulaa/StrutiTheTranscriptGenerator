@@ -42,6 +42,25 @@ pub enum Error {
 
     #[error("no transcript produced: {0}")]
     Empty(String),
+
+    /// Stored state that should exist doesn't, or kept changing.
+    #[error("{0}")]
+    State(String),
+
+    #[error("another Shruti is already processing the queue")]
+    QueueBusy,
+
+    #[error("the queue was stopped")]
+    Stopped,
+
+    #[error("lost the queue lock (database connection dropped): {0}")]
+    LockLost(String),
+
+    #[error("database error: {0}")]
+    Db(#[from] sqlx::Error),
+
+    #[error("database migration failed: {0}")]
+    Migrate(#[from] sqlx::migrate::MigrateError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

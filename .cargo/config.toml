@@ -1,0 +1,3 @@
+[env]
+# #[sqlx::test] creates a throwaway database per test on this server.
+DATABASE_URL = "postgres://rohansitoula@%2Fvar%2Frun%2Fpostgresql/shruti_test"
