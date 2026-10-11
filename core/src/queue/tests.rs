@@ -58,6 +58,9 @@ struct Shared {
     clean_override: Mutex<Option<String>>,
     /// Every Instagram request fails as throttled while set.
     instagram_blocked: AtomicBool,
+    /// Instagram requests in flight, and when each one started.
+    instagram: Gauge,
+    instagram_starts: Mutex<Vec<Instant>>,
     /// Flat listings by URL: entries, or yt-dlp's stderr for a failure.
     listings: Mutex<Vec<(String, std::result::Result<crate::expand::Listing, String>)>>,
 }
@@ -105,10 +108,29 @@ fn platform_of(url: &str) -> Platform {
     }
 }
 
+impl FakeFetcher {
+    /// Records an Instagram request's start and holds the gauge for its
+    /// (simulated) duration.
+    async fn instagram_request(&self, url: &str) -> Option<GaugeGuard<'_>> {
+        if platform_of(url) != Platform::Instagram {
+            return None;
+        }
+        self.shared
+            .instagram_starts
+            .lock()
+            .unwrap()
+            .push(Instant::now());
+        let guard = self.shared.instagram.enter();
+        tokio::time::sleep(self.delay).await;
+        Some(guard)
+    }
+}
+
 impl Fetcher for FakeFetcher {
     async fn metadata(&self, url: &str) -> Result<VideoMeta> {
         let id = id_of(url);
         self.shared.call(format!("metadata {id}"));
+        let _instagram = self.instagram_request(url).await;
         if platform_of(url) == Platform::Instagram
             && self.shared.instagram_blocked.load(Ordering::SeqCst)
         {
@@ -185,6 +207,7 @@ impl Fetcher for FakeFetcher {
     async fn audio(&self, url: &str, dir: &Path) -> Result<PathBuf> {
         let id = id_of(url);
         self.shared.call(format!("audio {id}"));
+        let _instagram = self.instagram_request(url).await;
         let _active = self.shared.downloads.enter();
         tokio::time::sleep(self.delay).await;
         let path = dir.join(AUDIO_FILE);
@@ -1548,5 +1571,89 @@ async fn instagram_requests_are_spaced_with_a_longer_pause_every_batch(pool: PgP
     assert!(
         third - second >= Duration::from_millis(250),
         "every 2 reels: {third:?}"
+    );
+}
+
+#[sqlx::test]
+async fn instagram_jobs_take_turns_spaced_out_while_youtube_runs_alongside(pool: PgPool) {
+    let gap = Duration::from_millis(80);
+    let limits = Limits {
+        instagram: Pacing {
+            gap,
+            ..Pacing::default()
+        },
+        ..Limits::default()
+    };
+    let h = harness(
+        pool,
+        limits,
+        Duration::from_millis(20),
+        Duration::from_millis(10),
+    );
+    let mut links: Vec<String> = ["igAAAAAAAA1", "igAAAAAAAA2", "igAAAAAAAA3"]
+        .map(reel)
+        .to_vec();
+    links.push(link("whisperAAAA"));
+    h.queue.enqueue(&links).await.unwrap();
+    let (token, handle) = start(&h);
+    let jobs = settle(&h).await;
+    stop(token, handle).await;
+
+    assert!(jobs.iter().all(|j| j.status == Status::Done), "{jobs:#?}");
+    assert_eq!(
+        h.shared.instagram.max(),
+        1,
+        "one Instagram request at a time"
+    );
+    let starts = h.shared.instagram_starts.lock().unwrap().clone();
+    assert_eq!(starts.len(), 6, "metadata and audio per reel");
+    for pair in starts.windows(2) {
+        // Each request starts at least `gap` after the previous one ended
+        // (it lasted 20 ms).
+        assert!(pair[1] - pair[0] >= gap, "{:?}", pair[1] - pair[0]);
+    }
+}
+
+#[sqlx::test]
+async fn preview_reports_bad_lines_and_counts_single_videos(pool: PgPool) {
+    let h = quick(pool);
+    let playlist = "https://www.youtube.com/playlist?list=PLbroken";
+    *h.shared.listings.lock().unwrap() = vec![(
+        playlist.into(),
+        Err("ERROR: This playlist does not exist".into()),
+    )];
+    finished(&h, "whisperAAAA").await;
+
+    let previews = h
+        .queue
+        .preview(&["junk", playlist, &link("whisperAAAA"), &link("whisperBBBB")])
+        .await;
+    let summary: Vec<(usize, usize, bool)> = previews
+        .iter()
+        .map(|p| (p.total, p.new, p.error.is_some()))
+        .collect();
+    assert_eq!(
+        summary,
+        [(0, 0, true), (0, 0, true), (1, 0, false), (1, 1, false)]
+    );
+    assert!(
+        previews[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("not a supported link")
+    );
+    assert!(
+        previews[1]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("does not exist")
+    );
+    assert_eq!(previews[2].title, None);
+    assert_eq!(
+        db::list_jobs(&h.pool, 10).await.unwrap().len(),
+        1,
+        "a preview adds nothing"
     );
 }

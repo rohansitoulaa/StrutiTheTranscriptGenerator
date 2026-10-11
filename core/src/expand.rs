@@ -126,10 +126,17 @@ pub async fn expand<F: Fetcher>(
         let listing = match fetcher.list(&url, remaining).await {
             Ok(listing) => listing,
             // "This channel does not have a shorts tab": nothing there.
-            Err(Error::ToolFailed { stderr, .. }) if stderr.contains("does not have a") => {
+            Err(Error::ToolFailed { stderr, .. })
+                if stderr.contains("does not have a") && stderr.contains(" tab") =>
+            {
+                tracing::debug!(%url, "no such tab; treating it as empty");
                 continue;
             }
-            Err(e) if matches!(source, Source::InstagramProfile { .. }) => {
+            // Throttling stays recognisable, so Instagram jobs pause.
+            Err(e @ Error::InstagramBlocked(_)) => return Err(e),
+            Err(e @ Error::ToolFailed { .. })
+                if matches!(source, Source::InstagramProfile { .. }) =>
+            {
                 return Err(Error::State(format!(
                     "could not list the profile (yt-dlp's Instagram profile support is \
                      marked broken upstream; an update may fix it, or paste the reel links): {e}"
@@ -400,6 +407,21 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(c.title, "Motion Design");
+    }
+
+    #[tokio::test]
+    async fn a_throttled_profile_listing_stays_a_block() {
+        let f = lister(vec![("https://www.instagram.com/someone/", || {
+            Err(Error::InstagramBlocked("429".into()))
+        })]);
+        let err = expand(
+            &f,
+            &Source::parse("https://www.instagram.com/someone/").unwrap(),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::InstagramBlocked(_)), "{err:?}");
     }
 
     #[tokio::test]

@@ -293,6 +293,9 @@ where
             let collection = match self.collection(&source).await {
                 Ok(c) => c,
                 Err(e) => {
+                    if matches!(e, Error::InstagramBlocked(_)) {
+                        self.pause_instagram(&e.to_string()).await;
+                    }
                     report.errors.push((input.to_string(), e.to_string()));
                     continue;
                 }
@@ -329,22 +332,22 @@ where
             };
             let counted = async {
                 let source = Source::parse(input)?;
-                let keys = match source.video_key() {
-                    Some(key) => vec![key],
+                let (title, keys) = match source.video_key() {
+                    Some(key) => (None, vec![key]),
                     None => {
                         let collection = self.collection(&source).await?;
-                        preview.title = Some(collection.title);
-                        collection.videos.into_iter().map(|v| v.key).collect()
+                        let keys = collection.videos.into_iter().map(|v| v.key).collect();
+                        (Some(collection.title), keys)
                     }
                 };
                 let known = db::known_keys(&self.db, &keys).await?;
-                Ok::<_, Error>((
-                    keys.len(),
-                    keys.iter().filter(|k| !known.contains(*k)).count(),
-                ))
+                let new = keys.iter().filter(|k| !known.contains(*k)).count();
+                Ok::<_, Error>((title, keys.len(), new))
             };
             match counted.await {
-                Ok((total, new)) => (preview.total, preview.new) = (total, new),
+                Ok((title, total, new)) => {
+                    (preview.title, preview.total, preview.new) = (title, total, new)
+                }
                 Err(e) => preview.error = Some(e.to_string()),
             }
             previews.push(preview);
@@ -366,8 +369,9 @@ where
                 .await?;
             expand::expand(&self.engine.fetcher, source, self.expand_limit).await?
         };
-        self.cached_listings()
-            .insert(url, (Instant::now(), collection.clone()));
+        let mut cache = self.cached_listings();
+        cache.retain(|_, (at, _)| at.elapsed() < LISTING_TTL);
+        cache.insert(url, (Instant::now(), collection.clone()));
         Ok(collection)
     }
 

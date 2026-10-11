@@ -140,10 +140,11 @@ pub struct Job {
     pub folder: Option<String>,
     /// From `videos`, once metadata has been fetched.
     pub title: Option<String>,
+    pub channel: Option<String>,
 }
 
 const JOB_COLUMNS: &str = "j.id, j.batch_id, j.input, j.url, j.video_key, j.stage, j.status, j.reason, \
-     j.caption_error, j.attempts, j.review, j.note_path, j.folder, v.title";
+     j.caption_error, j.attempts, j.review, j.note_path, j.folder, v.title, v.channel";
 
 fn job_from_row(row: &PgRow) -> Result<Job> {
     Ok(Job {
@@ -161,6 +162,7 @@ fn job_from_row(row: &PgRow) -> Result<Job> {
         note_path: row.try_get("note_path")?,
         folder: row.try_get("folder")?,
         title: row.try_get("title")?,
+        channel: row.try_get("channel")?,
     })
 }
 
