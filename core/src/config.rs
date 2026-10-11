@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::cleanup::CleanupSettings;
+use crate::llm::{LlmClient, Provider, ProviderKind};
 use crate::pipeline::Engine;
 use crate::queue::Limits;
 use crate::whisper::WhisperCli;
@@ -30,6 +32,31 @@ pub struct Config {
     /// Audio waiting between the download and Whisper stages.
     pub work_dir: PathBuf,
     pub limits: Limits,
+    pub llm: LlmSettings,
+    /// Transcript tokens per cleanup request; `None` picks one for the
+    /// provider (small for a local model's 4k context, large for cloud).
+    pub chunk_tokens: Option<usize>,
+}
+
+/// Which model does cleanup and sorting (PDA CL-7, LLM-1). The API key is
+/// not here: it lives in the keyring (LLM-5) and is read when needed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmSettings {
+    pub kind: ProviderKind,
+    pub model: String,
+    /// Overrides the provider's default; required for `custom`.
+    pub base_url: Option<String>,
+}
+
+impl Default for LlmSettings {
+    fn default() -> Self {
+        LlmSettings {
+            kind: ProviderKind::LmStudio,
+            // The model already installed in LM Studio (PDA CL-7).
+            model: "google/gemma-4-31b".into(),
+            base_url: None,
+        }
+    }
 }
 
 impl Config {
@@ -49,6 +76,8 @@ impl Config {
             database_url: local_database_url(user, "shruti"),
             work_dir: home.join(".cache/shruti/work"),
             limits: Limits::default(),
+            llm: LlmSettings::default(),
+            chunk_tokens: None,
         }
     }
 
@@ -99,6 +128,30 @@ impl Config {
         if let Some(v) = var("SHRUTI_DOWNLOADS").filter(|v| !v.is_empty()) {
             c.limits.downloads = number("SHRUTI_DOWNLOADS", &v)?.max(1) as usize;
         }
+        if let Some(v) = var("SHRUTI_LLM_PROVIDER").filter(|v| !v.is_empty()) {
+            c.llm.kind = ProviderKind::parse(&v).ok_or_else(|| Error::Parse {
+                what: "settings",
+                reason: format!(
+                    "SHRUTI_LLM_PROVIDER={v:?} is not one of lmstudio, openai, gemini, custom"
+                ),
+            })?;
+            // Cloud providers can take a few requests at once (LLM-7).
+            if !c.llm.kind.is_local() {
+                c.limits.llm = 2;
+            }
+        }
+        if let Some(v) = var("SHRUTI_LLM_MODEL").filter(|v| !v.is_empty()) {
+            c.llm.model = v;
+        }
+        if let Some(v) = var("SHRUTI_LLM_BASE_URL") {
+            c.llm.base_url = optional(v);
+        }
+        if let Some(v) = var("SHRUTI_LLM_CONCURRENCY").filter(|v| !v.is_empty()) {
+            c.limits.llm = number("SHRUTI_LLM_CONCURRENCY", &v)?.max(1) as usize;
+        }
+        if let Some(v) = var("SHRUTI_CHUNK_TOKENS").filter(|v| !v.is_empty()) {
+            c.chunk_tokens = Some(number("SHRUTI_CHUNK_TOKENS", &v)?.max(100) as usize);
+        }
         if let Some(v) = var("SHRUTI_THREADS") {
             c.threads = if v.is_empty() {
                 None
@@ -132,6 +185,51 @@ impl Config {
                 .map(|(what, path)| format!("{what} not found at {}", path.display())),
         );
         problems
+    }
+
+    pub fn llm_base_url(&self) -> Result<String> {
+        match (&self.llm.base_url, self.llm.kind.default_base_url()) {
+            (Some(url), _) => Ok(url.clone()),
+            (None, Some(url)) => Ok(url.to_string()),
+            (None, None) => Err(Error::Parse {
+                what: "settings",
+                reason: "a custom LLM provider needs SHRUTI_LLM_BASE_URL".into(),
+            }),
+        }
+    }
+
+    /// The LLM client, with its API key read from the keyring for cloud
+    /// providers. A missing key isn't an error here: the provider rejects
+    /// the request and jobs wait with that reason (CL-8).
+    pub async fn build_llm(&self) -> Result<LlmClient> {
+        let kind = self.llm.kind;
+        let api_key = if kind.is_local() {
+            None
+        } else {
+            tokio::task::spawn_blocking(move || crate::secrets::api_key(kind))
+                .await
+                .map_err(|e| Error::Keyring(e.to_string()))??
+        };
+        let provider = Provider {
+            kind,
+            base_url: self.llm_base_url()?,
+            api_key,
+            model: self.llm.model.clone(),
+        };
+        Ok(LlmClient::new(provider)?)
+    }
+
+    pub fn cleanup_settings(&self) -> CleanupSettings {
+        let defaults = CleanupSettings::default();
+        let chunk_tokens = self.chunk_tokens.unwrap_or(if self.llm.kind.is_local() {
+            defaults.chunk_tokens
+        } else {
+            8_000
+        });
+        CleanupSettings {
+            chunk_tokens,
+            ..defaults
+        }
     }
 
     /// Builds the engine, probing for the discrete GPU when set to `Auto`.
@@ -219,6 +317,55 @@ mod tests {
         );
         assert_eq!(c.work_dir, PathBuf::from("/home/me/.cache/shruti/work"));
         assert_eq!(c.limits.downloads, 3);
+        assert_eq!(c.llm, LlmSettings::default());
+        assert_eq!(c.limits.llm, 1);
+        assert_eq!(c.cleanup_settings().chunk_tokens, 1_200);
+        assert_eq!(c.llm_base_url().unwrap(), "http://localhost:1234/v1");
+    }
+
+    #[test]
+    fn llm_settings_from_env() {
+        let c = Config::from_env(
+            Path::new("/repo"),
+            env(&[
+                ("SHRUTI_LLM_PROVIDER", "gemini"),
+                ("SHRUTI_LLM_MODEL", "gemini-flash-lite"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(c.llm.kind, ProviderKind::Gemini);
+        assert_eq!(c.llm.model, "gemini-flash-lite");
+        assert_eq!(c.limits.llm, 2, "cloud providers run a few at once");
+        assert_eq!(c.cleanup_settings().chunk_tokens, 8_000);
+        assert_eq!(
+            c.llm_base_url().unwrap(),
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        );
+
+        let c = Config::from_env(
+            Path::new("/repo"),
+            env(&[
+                ("SHRUTI_LLM_PROVIDER", "custom"),
+                ("SHRUTI_LLM_CONCURRENCY", "4"),
+                ("SHRUTI_CHUNK_TOKENS", "3000"),
+            ]),
+        )
+        .unwrap();
+        assert!(
+            c.llm_base_url()
+                .unwrap_err()
+                .to_string()
+                .contains("SHRUTI_LLM_BASE_URL")
+        );
+        assert_eq!(c.limits.llm, 4);
+        assert_eq!(c.cleanup_settings().chunk_tokens, 3_000);
+
+        let err = Config::from_env(
+            Path::new("/repo"),
+            env(&[("SHRUTI_LLM_PROVIDER", "claude")]),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("SHRUTI_LLM_PROVIDER"), "{err}");
     }
 
     #[test]

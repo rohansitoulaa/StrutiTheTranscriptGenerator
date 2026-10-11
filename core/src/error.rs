@@ -56,6 +56,12 @@ pub enum Error {
     #[error("lost the queue lock (database connection dropped): {0}")]
     LockLost(String),
 
+    #[error(transparent)]
+    Llm(#[from] crate::llm::LlmError),
+
+    #[error("keyring: {0}")]
+    Keyring(String),
+
     #[error("database error: {0}")]
     Db(#[from] sqlx::Error),
 

@@ -10,6 +10,7 @@ use sqlx::postgres::{PgConnection, PgPool, PgPoolOptions};
 use sqlx::{Row, postgres::PgRow};
 use uuid::Uuid;
 
+use crate::cleanup::Cleaned;
 use crate::metadata::{CaptionKind, Platform, VideoMeta};
 use crate::transcript::{Segment, Transcript, TranscriptSource};
 use crate::{Error, Result};
@@ -135,12 +136,14 @@ pub struct Job {
     pub attempts: i32,
     pub review: bool,
     pub note_path: Option<String>,
+    /// Where the file stage placed the note: `Area/Topic` or `Inbox`.
+    pub folder: Option<String>,
     /// From `videos`, once metadata has been fetched.
     pub title: Option<String>,
 }
 
 const JOB_COLUMNS: &str = "j.id, j.batch_id, j.input, j.url, j.video_key, j.stage, j.status, j.reason, \
-     j.caption_error, j.attempts, j.review, j.note_path, v.title";
+     j.caption_error, j.attempts, j.review, j.note_path, j.folder, v.title";
 
 fn job_from_row(row: &PgRow) -> Result<Job> {
     Ok(Job {
@@ -156,6 +159,7 @@ fn job_from_row(row: &PgRow) -> Result<Job> {
         attempts: row.try_get("attempts")?,
         review: row.try_get("review")?,
         note_path: row.try_get("note_path")?,
+        folder: row.try_get("folder")?,
         title: row.try_get("title")?,
     })
 }
@@ -234,12 +238,15 @@ pub async fn add_job(
     )))
 }
 
-/// Takes the oldest queued job and marks it running. `SKIP LOCKED` keeps
+/// Takes the oldest queued job (or waiting job whose retry time has come)
+/// and marks it running. `SKIP LOCKED` keeps
 /// two dispatchers from ever taking the same job.
 pub async fn claim_next(pool: &PgPool) -> Result<Option<Job>> {
     let claimed: Option<i64> = sqlx::query_scalar(
         "UPDATE jobs SET status = 'running', updated_at = now()
-         WHERE id = (SELECT id FROM jobs WHERE status = 'queued' ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
+         WHERE id = (SELECT id FROM jobs
+                     WHERE status = 'queued' OR (status = 'waiting' AND retry_at <= now())
+                     ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
          RETURNING id",
     )
     .fetch_optional(pool)
@@ -303,23 +310,27 @@ pub async fn fail(pool: &PgPool, id: i64, reason: &str) -> Result<bool> {
     Ok(done.rows_affected() == 1)
 }
 
-pub async fn finish(pool: &PgPool, id: i64, note_path: &str) -> Result<bool> {
+/// `review` marks a note the cleanup guardrail flagged (PDA CL-6).
+pub async fn finish(pool: &PgPool, id: i64, note_path: &str, review: bool) -> Result<bool> {
     let done = sqlx::query(
         "UPDATE jobs SET stage = 'done', status = 'done', reason = NULL, note_path = $2,
-                finished_at = now(), updated_at = now()
+                review = $3, retry_at = NULL, finished_at = now(), updated_at = now()
          WHERE id = $1 AND status = 'running'",
     )
     .bind(id)
     .bind(note_path)
+    .bind(review)
     .execute(pool)
     .await?;
     Ok(done.rows_affected() == 1)
 }
 
-/// Puts a failed job back in the queue. Returns whether it was failed.
+/// Puts a failed or waiting job back in the queue now. Returns whether it
+/// was one.
 pub async fn retry(pool: &PgPool, id: i64) -> Result<bool> {
     let done = sqlx::query(
-        "UPDATE jobs SET status = 'queued', reason = NULL, updated_at = now() WHERE id = $1 AND status = 'failed'",
+        "UPDATE jobs SET status = 'queued', reason = NULL, retry_at = NULL, updated_at = now()
+         WHERE id = $1 AND status IN ('failed', 'waiting')",
     )
     .bind(id)
     .execute(pool)
@@ -334,6 +345,39 @@ pub async fn retry_all_failed(pool: &PgPool) -> Result<u64> {
     Ok(done.rows_affected())
 }
 
+/// Parks a running job until `retry_in` has passed: the LLM is down,
+/// rate limited or out of quota (PDA CL-8, LLM-6). Its stage is kept.
+pub async fn wait(
+    pool: &PgPool,
+    id: i64,
+    reason: &str,
+    retry_in: std::time::Duration,
+) -> Result<bool> {
+    let seconds = retry_in.as_secs_f64();
+    let done = sqlx::query(
+        "UPDATE jobs SET status = 'waiting', reason = $2,
+                retry_at = now() + make_interval(secs => $3), updated_at = now()
+         WHERE id = $1 AND status = 'running'",
+    )
+    .bind(id)
+    .bind(reason)
+    .bind(seconds)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+pub async fn set_folder(pool: &PgPool, id: i64, folder: &str) -> Result<bool> {
+    let done = sqlx::query(
+        "UPDATE jobs SET folder = $2, updated_at = now() WHERE id = $1 AND status = 'running'",
+    )
+    .bind(id)
+    .bind(folder)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
 /// Cancels a job that hasn't finished. Returns the stage it was at, or
 /// `None` if it had already finished or been cancelled.
 pub async fn cancel(pool: &PgPool, id: i64) -> Result<Option<Stage>> {
@@ -346,6 +390,42 @@ pub async fn cancel(pool: &PgPool, id: i64) -> Result<Option<Stage>> {
     .fetch_optional(pool)
     .await?;
     stage.as_deref().map(Stage::parse).transpose()
+}
+
+/// A job that re-runs cleanup (and the note) from the stored raw
+/// transcript, without downloading or transcribing again (PDA CL-9).
+pub async fn add_reclean_job(pool: &PgPool, batch_id: Uuid, video_key: &str) -> Result<Added> {
+    let url: Option<String> = sqlx::query_scalar(
+        "SELECT v.url FROM videos v JOIN transcripts t ON t.video_key = v.key WHERE v.key = $1",
+    )
+    .bind(video_key)
+    .fetch_optional(pool)
+    .await?;
+    let url = url
+        .ok_or_else(|| Error::State(format!("{video_key} has no stored transcript to re-clean")))?;
+    let inserted: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO jobs (batch_id, input, url, video_key, stage) VALUES ($1, $2, $3, $2, 'clean')
+         ON CONFLICT (video_key) WHERE status IN ('queued', 'running', 'waiting', 'failed') DO NOTHING
+         RETURNING id",
+    )
+    .bind(batch_id)
+    .bind(video_key)
+    .bind(&url)
+    .fetch_optional(pool)
+    .await?;
+    match inserted {
+        Some(id) => Ok(Added::New(id)),
+        None => {
+            let id: i64 = sqlx::query_scalar(
+                "SELECT id FROM jobs WHERE video_key = $1
+                 AND status IN ('queued', 'running', 'waiting', 'failed')",
+            )
+            .bind(video_key)
+            .fetch_one(pool)
+            .await?;
+            Ok(Added::AlreadyOpen(id))
+        }
+    }
 }
 
 pub async fn get_job(pool: &PgPool, id: i64) -> Result<Option<Job>> {
@@ -516,6 +596,105 @@ pub async fn load_transcript(pool: &PgPool, video_key: &str) -> Result<Option<Tr
     }))
 }
 
+/// Stores a cleanup run; earlier runs stay (DB-5).
+pub async fn insert_cleaning(pool: &PgPool, video_key: &str, cleaned: &Cleaned) -> Result<i64> {
+    let count = |n: usize| i32::try_from(n).unwrap_or(i32::MAX);
+    let tokens = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+    let id = sqlx::query_scalar(
+        "INSERT INTO cleanings (video_key, model, cleaned_text, translated, review, raw_words,
+                                clean_words, tokens_in, tokens_out)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+    )
+    .bind(video_key)
+    .bind(&cleaned.model)
+    .bind(&cleaned.text)
+    .bind(cleaned.translated)
+    .bind(cleaned.review)
+    .bind(count(cleaned.raw_words))
+    .bind(count(cleaned.clean_words))
+    .bind(tokens(cleaned.tokens_in))
+    .bind(tokens(cleaned.tokens_out))
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+/// The newest cleanup run for a video.
+pub async fn latest_cleaning(pool: &PgPool, video_key: &str) -> Result<Option<Cleaned>> {
+    let row = sqlx::query(
+        "SELECT model, cleaned_text, translated, review, raw_words, clean_words, tokens_in, tokens_out
+         FROM cleanings WHERE video_key = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(video_key)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    Ok(Some(Cleaned {
+        model: row.try_get("model")?,
+        text: row.try_get("cleaned_text")?,
+        translated: row.try_get("translated")?,
+        review: row.try_get("review")?,
+        raw_words: row.try_get::<i32, _>("raw_words")?.max(0) as usize,
+        clean_words: row.try_get::<i32, _>("clean_words")?.max(0) as usize,
+        tokens_in: row.try_get::<i64, _>("tokens_in")?.max(0) as u64,
+        tokens_out: row.try_get::<i64, _>("tokens_out")?.max(0) as u64,
+    }))
+}
+
+/// A note Shruti wrote and the fingerprint of what it wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteRecord {
+    pub path: String,
+    pub content_sha256: String,
+}
+
+pub async fn notes_for(pool: &PgPool, video_key: &str) -> Result<Vec<NoteRecord>> {
+    let rows = sqlx::query(
+        "SELECT path, content_sha256 FROM notes WHERE video_key = $1 ORDER BY written_at",
+    )
+    .bind(video_key)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok(NoteRecord {
+                path: r.try_get("path")?,
+                content_sha256: r.try_get("content_sha256")?,
+            })
+        })
+        .collect()
+}
+
+/// Records (or refreshes) what Shruti wrote at `path`. `moved_from` drops
+/// the record of the same note at its old location.
+pub async fn record_note(
+    pool: &PgPool,
+    video_key: &str,
+    path: &str,
+    content_sha256: &str,
+    moved_from: Option<&str>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    if let Some(old) = moved_from.filter(|old| *old != path) {
+        sqlx::query("DELETE FROM notes WHERE video_key = $1 AND path = $2")
+            .bind(video_key)
+            .bind(old)
+            .execute(&mut *tx)
+            .await?;
+    }
+    sqlx::query(
+        "INSERT INTO notes (video_key, path, content_sha256) VALUES ($1, $2, $3)
+         ON CONFLICT (video_key, path) DO UPDATE SET content_sha256 = EXCLUDED.content_sha256, written_at = now()",
+    )
+    .bind(video_key)
+    .bind(path)
+    .bind(content_sha256)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,7 +798,7 @@ mod tests {
             panic!()
         };
         claim_next(&pool).await.unwrap();
-        finish(&pool, id, "/vault/a.md").await.unwrap();
+        finish(&pool, id, "/vault/a.md", false).await.unwrap();
         assert_eq!(
             add(&pool, "youtube:a").await,
             Added::AlreadyDone {
@@ -758,7 +937,7 @@ mod tests {
         assert!(!set_stage(&pool, id, Stage::Transcribe).await.unwrap());
         assert!(!set_caption_error(&pool, id, Some("x")).await.unwrap());
         assert!(!fail(&pool, id, "late failure").await.unwrap());
-        assert!(!finish(&pool, id, "/late.md").await.unwrap());
+        assert!(!finish(&pool, id, "/late.md", false).await.unwrap());
         let job = get_job(&pool, id).await.unwrap().unwrap();
         assert_eq!(
             (job.status, job.stage, job.note_path),
@@ -776,5 +955,154 @@ mod tests {
             .unwrap()
             .expect("lock after release");
         drop(again);
+    }
+
+    fn cleaned(text: &str, review: bool) -> Cleaned {
+        Cleaned {
+            text: text.into(),
+            translated: true,
+            review,
+            model: "lmstudio/gemma".into(),
+            raw_words: 40,
+            clean_words: 20,
+            tokens_in: 900,
+            tokens_out: 300,
+        }
+    }
+
+    #[sqlx::test]
+    async fn cleanings_keep_every_run_and_return_the_newest(pool: PgPool) {
+        upsert_video(&pool, &meta("a")).await.unwrap();
+        insert_transcript(&pool, "youtube:a", &transcript("x"), None)
+            .await
+            .unwrap();
+        assert_eq!(latest_cleaning(&pool, "youtube:a").await.unwrap(), None);
+        insert_cleaning(&pool, "youtube:a", &cleaned("first", true))
+            .await
+            .unwrap();
+        insert_cleaning(&pool, "youtube:a", &cleaned("second", false))
+            .await
+            .unwrap();
+        assert_eq!(
+            latest_cleaning(&pool, "youtube:a").await.unwrap(),
+            Some(cleaned("second", false))
+        );
+        let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM cleanings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(runs, 2);
+    }
+
+    #[sqlx::test]
+    async fn waiting_jobs_come_back_when_their_time_comes(pool: PgPool) {
+        let Added::New(id) = add(&pool, "youtube:a").await else {
+            panic!()
+        };
+        claim_next(&pool).await.unwrap();
+        assert!(
+            wait(
+                &pool,
+                id,
+                "LLM not reachable",
+                std::time::Duration::from_secs(3600)
+            )
+            .await
+            .unwrap()
+        );
+        let job = get_job(&pool, id).await.unwrap().unwrap();
+        assert_eq!(
+            (job.status, job.reason.as_deref()),
+            (Status::Waiting, Some("LLM not reachable"))
+        );
+        assert_eq!(
+            claim_next(&pool).await.unwrap(),
+            None,
+            "not due for an hour"
+        );
+
+        sqlx::query("UPDATE jobs SET retry_at = now() - interval '1 second' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(claim_next(&pool).await.unwrap().unwrap().id, id);
+    }
+
+    #[sqlx::test]
+    async fn retry_wakes_a_waiting_job_immediately(pool: PgPool) {
+        let Added::New(id) = add(&pool, "youtube:a").await else {
+            panic!()
+        };
+        claim_next(&pool).await.unwrap();
+        wait(&pool, id, "quota", std::time::Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(retry(&pool, id).await.unwrap());
+        assert_eq!(claim_next(&pool).await.unwrap().unwrap().id, id);
+    }
+
+    #[sqlx::test]
+    async fn reclean_jobs_start_at_clean_and_need_a_transcript(pool: PgPool) {
+        upsert_video(&pool, &meta("a")).await.unwrap();
+        assert!(
+            add_reclean_job(&pool, Uuid::new_v4(), "youtube:a")
+                .await
+                .is_err()
+        );
+        insert_transcript(&pool, "youtube:a", &transcript("x"), None)
+            .await
+            .unwrap();
+        let Added::New(id) = add_reclean_job(&pool, Uuid::new_v4(), "youtube:a")
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let job = get_job(&pool, id).await.unwrap().unwrap();
+        assert_eq!((job.stage, job.status), (Stage::Clean, Status::Queued));
+        assert_eq!(
+            add_reclean_job(&pool, Uuid::new_v4(), "youtube:a")
+                .await
+                .unwrap(),
+            Added::AlreadyOpen(id)
+        );
+    }
+
+    #[sqlx::test]
+    async fn note_records_follow_moves(pool: PgPool) {
+        upsert_video(&pool, &meta("a")).await.unwrap();
+        record_note(&pool, "youtube:a", "/v/Inbox/a.md", "h1", None)
+            .await
+            .unwrap();
+        record_note(
+            &pool,
+            "youtube:a",
+            "/v/Design/UX/a.md",
+            "h2",
+            Some("/v/Inbox/a.md"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            notes_for(&pool, "youtube:a").await.unwrap(),
+            vec![NoteRecord {
+                path: "/v/Design/UX/a.md".into(),
+                content_sha256: "h2".into()
+            }]
+        );
+    }
+
+    #[sqlx::test]
+    async fn folder_is_stored_on_the_job(pool: PgPool) {
+        let Added::New(id) = add(&pool, "youtube:a").await else {
+            panic!()
+        };
+        claim_next(&pool).await.unwrap();
+        assert!(set_folder(&pool, id, "Design/UX").await.unwrap());
+        assert_eq!(
+            get_job(&pool, id).await.unwrap().unwrap().folder.as_deref(),
+            Some("Design/UX")
+        );
     }
 }

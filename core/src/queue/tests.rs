@@ -2,6 +2,7 @@
 //! record calls and measure how many of each stage ran at once.
 
 use super::*;
+use crate::llm::{ChatReply, LlmError};
 use crate::metadata::{CaptionKind, Platform};
 use crate::transcript::{Segment, Transcript, TranscriptSource};
 use pretty_assertions::assert_eq;
@@ -50,6 +51,11 @@ struct Shared {
     /// Video ids whose Whisper run errors, or panics.
     fail_whisper: Mutex<HashSet<String>>,
     panic_whisper: Mutex<HashSet<String>>,
+    /// LLM behaviour: an error to return, text to prepend to cleanups, or a
+    /// fixed cleanup reply.
+    llm_fail: Mutex<Option<LlmError>>,
+    clean_prefix: Mutex<String>,
+    clean_override: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -58,6 +64,13 @@ impl Shared {
     }
     fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
+    }
+    /// Calls to yt-dlp and Whisper only, without the LLM's.
+    fn tool_calls(&self) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter(|c| !c.starts_with("llm "))
+            .collect()
     }
     fn count(&self, prefix: &str) -> usize {
         self.calls()
@@ -187,8 +200,77 @@ impl Transcriber for FakeWhisper {
     }
 }
 
+/// Cleanup echoes the transcript (plus any prefix); the sorter always
+/// proposes Testing/Fakes, which exists after the first note.
+struct FakeLlm {
+    shared: Arc<Shared>,
+}
+
+impl Llm for FakeLlm {
+    async fn chat(&self, system: &str, user: &str) -> std::result::Result<ChatReply, LlmError> {
+        if let Some(e) = self.shared.llm_fail.lock().unwrap().clone() {
+            return Err(e);
+        }
+        let text = if system.contains("Area/Topic") {
+            self.shared.call("llm sort".into());
+            r#"{"new": {"area": "Testing", "topic": "Fakes", "description": "Notes from fake videos"}}"#
+                .to_string()
+        } else {
+            self.shared.call("llm clean".into());
+            match self.shared.clean_override.lock().unwrap().clone() {
+                Some(fixed) => fixed,
+                None => {
+                    let transcript = user.split("Transcript:\n\n").nth(1).unwrap_or_default();
+                    format!("{}{transcript}", self.shared.clean_prefix.lock().unwrap())
+                }
+            }
+        };
+        Ok(ChatReply {
+            text,
+            tokens_in: Some(10),
+            tokens_out: Some(5),
+        })
+    }
+
+    fn label(&self) -> String {
+        "fake/model".into()
+    }
+}
+
+type TestQueue = Queue<FakeFetcher, FakeWhisper, FakeLlm>;
+
+fn build_queue(
+    pool: &PgPool,
+    shared: &Arc<Shared>,
+    work: &Path,
+    out: &Path,
+    limits: Limits,
+    delays: (Duration, Duration),
+) -> Arc<TestQueue> {
+    Queue::new(QueueParts {
+        db: pool.clone(),
+        engine: Engine {
+            fetcher: FakeFetcher {
+                shared: Arc::clone(shared),
+                delay: delays.0,
+            },
+            transcriber: FakeWhisper {
+                shared: Arc::clone(shared),
+                delay: delays.1,
+            },
+        },
+        llm: FakeLlm {
+            shared: Arc::clone(shared),
+        },
+        cleanup: CleanupSettings::default(),
+        work_dir: work.to_path_buf(),
+        out_dir: out.to_path_buf(),
+        limits,
+    })
+}
+
 struct Harness {
-    queue: Arc<Queue<FakeFetcher, FakeWhisper>>,
+    queue: Arc<TestQueue>,
     shared: Arc<Shared>,
     pool: PgPool,
     _dirs: tempfile::TempDir,
@@ -206,17 +288,14 @@ fn harness(
     let dirs = tempfile::tempdir().unwrap();
     let out = dirs.path().join("out");
     let work = dirs.path().join("work");
-    let engine = Engine {
-        fetcher: FakeFetcher {
-            shared: Arc::clone(&shared),
-            delay: download_delay,
-        },
-        transcriber: FakeWhisper {
-            shared: Arc::clone(&shared),
-            delay: whisper_delay,
-        },
-    };
-    let queue = Queue::new(pool.clone(), engine, work.clone(), out.clone(), limits);
+    let queue = build_queue(
+        &pool,
+        &shared,
+        &work,
+        &out,
+        limits,
+        (download_delay, whisper_delay),
+    );
     Harness {
         queue,
         shared,
@@ -317,7 +396,15 @@ async fn jobs_run_to_notes_via_captions_or_whisper(pool: PgPool) {
         !h.work.join("youtube_whisperBBBB").exists(),
         "audio folder should be cleaned up"
     );
-    assert_eq!(std::fs::read_dir(&h.out).unwrap().count(), 2);
+    let filed = h.out.join("Testing/Fakes");
+    let notes = std::fs::read_dir(&filed).unwrap().filter(|e| {
+        e.as_ref()
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|x| x == "md")
+    });
+    assert_eq!(notes.count(), 2);
 }
 
 #[sqlx::test]
@@ -396,6 +483,7 @@ async fn whisper_runs_one_at_a_time_while_downloads_overlap_it(pool: PgPool) {
     let limits = Limits {
         downloads: 2,
         whisper: 1,
+        llm: 1,
     };
     let h = harness(
         pool,
@@ -436,14 +524,14 @@ async fn a_restart_resumes_without_redoing_finished_stages(pool: PgPool) {
     let job_dir = h.work.join("youtube_whisperAAAA");
     std::fs::create_dir_all(&job_dir).unwrap();
     std::fs::write(job_dir.join(AUDIO_FILE), b"fake wav").unwrap();
-    let before = h.shared.calls().len();
+    let before = h.shared.tool_calls().len();
 
     let (token, handle) = start(&h);
     let jobs = settle(&h).await;
     stop(token, handle).await;
     assert_eq!(jobs[0].status, Status::Done);
     assert_eq!(
-        h.shared.calls()[before..],
+        h.shared.tool_calls()[before..],
         ["whisper youtube_whisperAAAA".to_string()]
     );
 }
@@ -485,22 +573,13 @@ async fn shutdown_mid_job_leaves_it_to_resume_on_the_next_run(pool: PgPool) {
     );
 
     // Next launch, with a fast Whisper: picks up at transcribe.
-    let engine = Engine {
-        fetcher: FakeFetcher {
-            shared: Arc::clone(&h.shared),
-            delay: Duration::ZERO,
-        },
-        transcriber: FakeWhisper {
-            shared: Arc::clone(&h.shared),
-            delay: Duration::ZERO,
-        },
-    };
-    let queue = Queue::new(
-        h.pool.clone(),
-        engine,
-        h.work.clone(),
-        h.out.clone(),
+    let queue = build_queue(
+        &h.pool,
+        &h.shared,
+        &h.work,
+        &h.out,
         Limits::default(),
+        (Duration::ZERO, Duration::ZERO),
     );
     let token = CancellationToken::new();
     let handle = tokio::spawn(Arc::clone(&queue).run(token.clone()));
@@ -620,22 +699,13 @@ async fn caption_failure_falls_back_and_its_reason_survives_a_restart(pool: PgPo
     stop(token, handle).await;
 
     // Next launch picks up at transcribe with the reason it stored.
-    let engine = Engine {
-        fetcher: FakeFetcher {
-            shared: Arc::clone(&h.shared),
-            delay: Duration::ZERO,
-        },
-        transcriber: FakeWhisper {
-            shared: Arc::clone(&h.shared),
-            delay: Duration::ZERO,
-        },
-    };
-    let queue = Queue::new(
-        h.pool.clone(),
-        engine,
-        h.work.clone(),
-        h.out.clone(),
+    let queue = build_queue(
+        &h.pool,
+        &h.shared,
+        &h.work,
+        &h.out,
         Limits::default(),
+        (Duration::ZERO, Duration::ZERO),
     );
     let token = CancellationToken::new();
     let handle = tokio::spawn(Arc::clone(&queue).run(token.clone()));
@@ -740,14 +810,14 @@ async fn a_stored_transcript_skips_fetching_and_whisper(pool: PgPool) {
         .unwrap();
     db::claim_next(&h.pool).await.unwrap();
     db::set_stage(&h.pool, id, Stage::Fetch).await.unwrap();
-    let before = h.shared.calls().len();
+    let before = h.shared.tool_calls().len();
 
     let (token, handle) = start(&h);
     let jobs = settle(&h).await;
     stop(token, handle).await;
     assert_eq!(jobs[0].status, Status::Done);
     assert!(
-        h.shared.calls()[before..].is_empty(),
+        h.shared.tool_calls()[before..].is_empty(),
         "{:?}",
         h.shared.calls()
     );
@@ -779,14 +849,14 @@ async fn a_stored_transcript_also_skips_whisper_when_resuming_at_transcribe(pool
     let job_dir = h.work.join("youtube_whisperAAAA");
     std::fs::create_dir_all(&job_dir).unwrap();
     std::fs::write(job_dir.join(AUDIO_FILE), b"fake wav").unwrap();
-    let before = h.shared.calls().len();
+    let before = h.shared.tool_calls().len();
 
     let (token, handle) = start(&h);
     let jobs = settle(&h).await;
     stop(token, handle).await;
     assert_eq!(jobs[0].status, Status::Done);
     assert!(
-        h.shared.calls()[before..].is_empty(),
+        h.shared.tool_calls()[before..].is_empty(),
         "{:?}",
         h.shared.calls()
     );
@@ -909,6 +979,199 @@ async fn re_pasting_a_failed_link_lands_in_the_retried_bucket(pool: PgPool) {
     let jobs = settle(&h).await;
     stop(token, handle).await;
     assert_eq!(jobs[0].status, Status::Done);
+}
+
+fn note_of(job: &Job) -> String {
+    std::fs::read_to_string(job.note_path.as_ref().expect("a note path")).unwrap()
+}
+
+async fn count(pool: &PgPool, sql: &'static str) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+}
+
+#[sqlx::test]
+async fn notes_are_cleaned_and_filed_into_a_sorted_folder(pool: PgPool) {
+    let h = quick(pool);
+    h.queue
+        .enqueue(&[link("capAAAAAAAA"), link("whisperBBBB")])
+        .await
+        .unwrap();
+    let (token, handle) = start(&h);
+    let jobs = settle(&h).await;
+    stop(token, handle).await;
+
+    for job in &jobs {
+        assert_eq!(job.status, Status::Done, "{job:#?}");
+        assert!(!job.review);
+        assert_eq!(job.folder.as_deref(), Some("Testing/Fakes"));
+        let path = PathBuf::from(job.note_path.as_ref().unwrap());
+        assert_eq!(path.parent().unwrap(), h.out.join("Testing/Fakes"));
+        let note = note_of(job);
+        assert!(
+            note.contains("cleaned_by: \"fake/model\"\ncleanup: ok"),
+            "{note}"
+        );
+        assert!(
+            note.ends_with("---\n\ncaption words.\n") || note.ends_with("---\n\nspoken words.\n"),
+            "{note}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(h.out.join("Testing/Fakes/.shruti")).unwrap(),
+        "Notes from fake videos\n"
+    );
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM cleanings").await, 2);
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM notes").await, 2);
+}
+
+#[sqlx::test]
+async fn an_unreachable_llm_parks_jobs_until_it_is_back(pool: PgPool) {
+    let h = quick(pool);
+    *h.shared.llm_fail.lock().unwrap() = Some(LlmError::Unreachable {
+        url: "http://localhost:1234/v1/chat/completions".into(),
+        reason: "could not connect".into(),
+    });
+    let mut events = h.queue.subscribe();
+    let id = h.queue.enqueue(&[link("whisperAAAA")]).await.unwrap().added[0];
+    let (token, handle) = start(&h);
+    let jobs = settle(&h).await;
+    let job = &jobs[0];
+    assert_eq!((job.status, job.stage), (Status::Waiting, Stage::Clean));
+    assert!(job.reason.as_deref().unwrap().contains("could not connect"));
+    let mut waited = false;
+    while let Ok(e) = events.try_recv() {
+        waited |= e.status == Status::Waiting && e.stage == Stage::Clean;
+    }
+    assert!(waited, "a Waiting event");
+    assert_eq!(
+        h.shared.count("whisper"),
+        1,
+        "transcription isn't redone while waiting"
+    );
+
+    *h.shared.llm_fail.lock().unwrap() = None;
+    assert!(h.queue.retry(id).await.unwrap());
+    let jobs = settle(&h).await;
+    stop(token, handle).await;
+    assert_eq!(jobs[0].status, Status::Done);
+    assert_eq!(h.shared.count("whisper"), 1);
+}
+
+#[sqlx::test]
+async fn an_unusable_llm_reply_fails_the_job(pool: PgPool) {
+    let h = quick(pool);
+    *h.shared.llm_fail.lock().unwrap() = Some(LlmError::BadResponse("<html>".into()));
+    h.queue.enqueue(&[link("whisperAAAA")]).await.unwrap();
+    let (token, handle) = start(&h);
+    let jobs = settle(&h).await;
+    stop(token, handle).await;
+    assert_eq!(
+        (jobs[0].status, jobs[0].stage),
+        (Status::Failed, Stage::Clean)
+    );
+}
+
+#[sqlx::test]
+async fn a_suspicious_cleanup_is_written_but_flagged_for_review(pool: PgPool) {
+    let h = quick(pool);
+    *h.shared.clean_override.lock().unwrap() = Some(String::new());
+    h.queue.enqueue(&[link("whisperAAAA")]).await.unwrap();
+    let (token, handle) = start(&h);
+    let jobs = settle(&h).await;
+    stop(token, handle).await;
+    assert_eq!(jobs[0].status, Status::Done);
+    assert!(jobs[0].review);
+    assert!(note_of(&jobs[0]).contains("cleanup: review"));
+}
+
+/// Runs one link to a finished note and returns the job.
+async fn finished(h: &Harness, id: &str) -> Job {
+    h.queue.enqueue(&[link(id)]).await.unwrap();
+    let (token, handle) = start(h);
+    let jobs = settle(h).await;
+    stop(token, handle).await;
+    jobs.into_iter()
+        .find(|j| j.video_key.ends_with(id))
+        .unwrap()
+}
+
+async fn reclean(h: &Harness, id: &str) -> Job {
+    let key = format!("youtube:{id}");
+    let results = h.queue.reclean(std::slice::from_ref(&key)).await.unwrap();
+    assert!(
+        matches!(results[0].1, Ok(Added::New(_))),
+        "{:?}",
+        results[0].1
+    );
+    let (token, handle) = start(h);
+    let jobs = settle(h).await;
+    stop(token, handle).await;
+    jobs.into_iter().find(|j| j.video_key == key).unwrap()
+}
+
+#[sqlx::test]
+async fn reclean_rewrites_an_unedited_note_in_place(pool: PgPool) {
+    let h = quick(pool);
+    let first = finished(&h, "whisperAAAA").await;
+    let sorts = h.shared.count("llm sort");
+    *h.shared.clean_prefix.lock().unwrap() = "Revised. ".into();
+
+    let again = reclean(&h, "whisperAAAA").await;
+    assert_eq!(again.status, Status::Done);
+    assert_eq!(
+        again.note_path, first.note_path,
+        "same note, updated in place"
+    );
+    assert!(note_of(&again).contains("Revised. spoken words."));
+    assert_eq!(h.shared.count("whisper"), 1, "no re-transcription");
+    assert_eq!(h.shared.count("llm sort"), sorts, "no re-filing");
+    assert_eq!(count(&h.pool, "SELECT count(*) FROM cleanings").await, 2);
+}
+
+#[sqlx::test]
+async fn reclean_never_overwrites_an_edited_note(pool: PgPool) {
+    let h = quick(pool);
+    let first = finished(&h, "whisperAAAA").await;
+    let original = PathBuf::from(first.note_path.as_ref().unwrap());
+    std::fs::write(&original, "my own notes").unwrap();
+    *h.shared.clean_prefix.lock().unwrap() = "Revised. ".into();
+
+    let again = reclean(&h, "whisperAAAA").await;
+    let copy = PathBuf::from(again.note_path.as_ref().unwrap());
+    assert_ne!(copy, original);
+    assert_eq!(
+        copy.parent(),
+        original.parent(),
+        "the new copy sits next to the edited one"
+    );
+    assert_eq!(std::fs::read_to_string(&original).unwrap(), "my own notes");
+    assert!(note_of(&again).contains("Revised."));
+}
+
+#[sqlx::test]
+async fn reclean_follows_a_note_moved_in_obsidian(pool: PgPool) {
+    let h = quick(pool);
+    let first = finished(&h, "whisperAAAA").await;
+    let original = PathBuf::from(first.note_path.as_ref().unwrap());
+    let moved = h.out.join("Mine/Picked By Hand/renamed.md");
+    std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    *h.shared.clean_prefix.lock().unwrap() = "Revised. ".into();
+
+    let again = reclean(&h, "whisperAAAA").await;
+    assert_eq!(
+        again.note_path.as_deref(),
+        Some(moved.display().to_string().as_str())
+    );
+    assert!(
+        std::fs::read_to_string(&moved)
+            .unwrap()
+            .contains("Revised.")
+    );
+    assert!(!original.exists(), "never moved back");
+    let recorded = db::notes_for(&h.pool, "youtube:whisperAAAA").await.unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].path, moved.display().to_string());
 }
 
 #[test]

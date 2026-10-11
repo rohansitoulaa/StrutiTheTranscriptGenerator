@@ -259,8 +259,15 @@ large:
 
 **Decided:** this machine has an RTX 4060 Laptop GPU on the open-source
 nouveau/NVK driver (no proprietary driver, so no CUDA). Vulkan works on it via
-NVK, so whisper.cpp is built with `-DGGML_VULKAN=1`. Cap LM Studio's GPU
-offload so Whisper keeps ~2 GB of VRAM.
+NVK, so whisper.cpp is built with `-DGGML_VULKAN=1`.
+
+**LM Studio must load models with GPU offload off** (`lms load
+google/gemma-4-31b -c 8192 --gpu off`). Measured in step 2b: its automatic
+offload crashes llama-server (SIGABRT at 89% loaded) under NVK. CPU-only
+loads in ~8 s and uses ~18.5 GB of RAM, and leaves the 4060 to Whisper. The
+cost is speed: a one-word round trip takes ~25 s, and cleaning an 83 s reel
+takes several minutes. A cloud provider (Gemini, OpenAI) is the fast path
+for big batches.
 
 **Vulkan device 0 is the Intel Arc iGPU, and whisper.cpp picks it by
 default.** The core probes the device list once at startup and passes

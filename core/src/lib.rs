@@ -6,14 +6,18 @@
 //! knows about windows or IPC.
 
 pub mod captions;
+pub mod cleanup;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod folders;
+pub mod llm;
 pub mod metadata;
 pub mod output;
 pub mod pipeline;
 mod process;
 pub mod queue;
+pub mod secrets;
 pub mod source;
 pub mod transcript;
 pub mod whisper;

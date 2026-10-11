@@ -20,10 +20,15 @@ use tokio::task::{AbortHandle, JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::cleanup::{self, CleanupSettings};
 use crate::db::{self, Added, Job, Stage, Status};
 use crate::error::fs_err;
+use crate::folders::{self, FolderTree, Placement};
+use crate::llm::Llm;
 use crate::metadata::VideoMeta;
-use crate::output::write_note;
+use crate::output::{
+    find_notes_by_id, note_title, render_note, sha256_hex, update_note, write_note,
+};
 use crate::pipeline::{Engine, Fetched};
 use crate::source::Source;
 use crate::transcript::Transcript;
@@ -37,6 +42,9 @@ pub struct Limits {
     pub downloads: usize,
     /// Concurrent Whisper runs. One saturates the GPU; two only slow both.
     pub whisper: usize,
+    /// Concurrent LLM requests: 1 for a local model, a few for cloud
+    /// providers (PDA LLM-7).
+    pub llm: usize,
 }
 
 impl Default for Limits {
@@ -44,6 +52,7 @@ impl Default for Limits {
         Limits {
             downloads: 3,
             whisper: 1,
+            llm: 1,
         }
     }
 }
@@ -90,16 +99,20 @@ pub fn state_label(stage: Stage, status: Status) -> &'static str {
     }
 }
 
-pub struct Queue<F, T> {
+pub struct Queue<F, T, L> {
     db: PgPool,
     engine: Engine<F, T>,
+    llm: L,
+    cleanup: CleanupSettings,
     /// Per-job audio lives here between the fetch and transcribe stages, so
     /// a restart doesn't re-download it.
     work_dir: PathBuf,
+    /// The `Shruti/` root in the vault; notes go in `Area/Topic` below it.
     out_dir: PathBuf,
     limits: Limits,
     downloads: Semaphore,
     whisper: Semaphore,
+    llm_slots: Semaphore,
     wake: Notify,
     paused: AtomicBool,
     events: broadcast::Sender<JobEvent>,
@@ -114,25 +127,43 @@ fn local_today() -> String {
 /// Each spawned job task, by task id: the job it runs and its stage at claim.
 type TaskJobs = HashMap<tokio::task::Id, (i64, Stage)>;
 
-impl<F, T> Queue<F, T>
+/// The pieces a queue is built from.
+pub struct QueueParts<F, T, L> {
+    pub db: PgPool,
+    pub engine: Engine<F, T>,
+    pub llm: L,
+    pub cleanup: CleanupSettings,
+    pub work_dir: PathBuf,
+    pub out_dir: PathBuf,
+    pub limits: Limits,
+}
+
+impl<F, T, L> Queue<F, T, L>
 where
     F: Fetcher + Send + Sync + 'static,
     T: Transcriber + Send + Sync + 'static,
+    L: Llm + Send + Sync + 'static,
 {
-    pub fn new(
-        db: PgPool,
-        engine: Engine<F, T>,
-        work_dir: PathBuf,
-        out_dir: PathBuf,
-        limits: Limits,
-    ) -> Arc<Self> {
+    pub fn new(parts: QueueParts<F, T, L>) -> Arc<Self> {
+        let QueueParts {
+            db,
+            engine,
+            llm,
+            cleanup,
+            work_dir,
+            out_dir,
+            limits,
+        } = parts;
         Arc::new(Queue {
             db,
             engine,
+            llm,
+            cleanup,
             work_dir,
             out_dir,
             downloads: Semaphore::new(limits.downloads.max(1)),
             whisper: Semaphore::new(limits.whisper.max(1)),
+            llm_slots: Semaphore::new(limits.llm.max(1)),
             limits,
             wake: Notify::new(),
             paused: AtomicBool::new(false),
@@ -199,7 +230,7 @@ where
         }
         // Enough jobs in flight to keep every stage busy, without claiming
         // the whole queue at once.
-        let max_in_flight = self.limits.downloads + self.limits.whisper + 1;
+        let max_in_flight = self.limits.downloads + self.limits.whisper + self.limits.llm + 1;
         let mut tasks = JoinSet::new();
         let mut task_jobs = TaskJobs::new();
         let mut lock_check = tokio::time::interval(Duration::from_secs(30));
@@ -309,6 +340,19 @@ where
         Ok(n)
     }
 
+    /// Re-runs cleanup (and rewrites the note) for videos already
+    /// transcribed, from the stored raw transcript (PDA CL-9).
+    pub async fn reclean(&self, video_keys: &[String]) -> Result<Vec<(String, Result<Added>)>> {
+        let batch_id = Uuid::new_v4();
+        let mut results = Vec::with_capacity(video_keys.len());
+        for key in video_keys {
+            let added = db::add_reclean_job(&self.db, batch_id, key).await;
+            results.push((key.clone(), added));
+        }
+        self.wake.notify_one();
+        Ok(results)
+    }
+
     /// Cancels a job. A running one is aborted (its subprocess is killed
     /// with it); if it gets past the abort, it stops at its next stage
     /// transition, since those only apply to running jobs.
@@ -346,9 +390,17 @@ where
     }
 
     async fn process(self: Arc<Self>, job: Job) {
-        if let Err(e) = self.run_stages(&job).await {
-            tracing::warn!(job = job.id, key = %job.video_key, reason = %e, "job failed");
-            self.record_failure(job.id, job.stage, &e.to_string()).await;
+        match self.run_stages(&job).await {
+            Ok(()) => {}
+            Err(Error::Llm(e)) if e.should_wait() => {
+                tracing::info!(job = job.id, reason = %e, "waiting for the LLM");
+                self.record_wait(job.id, job.stage, &e.to_string(), e.retry_after())
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(job = job.id, key = %job.video_key, reason = %e, "job failed");
+                self.record_failure(job.id, job.stage, &e.to_string()).await;
+            }
         }
         self.running_jobs().remove(&job.id);
         self.wake.notify_one();
@@ -378,10 +430,26 @@ where
         self.emit(id, stage, Status::Failed, Some(reason.to_string()));
     }
 
+    /// Parks a job until the LLM is likely back (PDA CL-8, LLM-6).
+    async fn record_wait(&self, id: i64, fallback_stage: Stage, reason: &str, retry_in: Duration) {
+        match db::wait(&self.db, id, reason, retry_in).await {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => tracing::error!(job = id, error = %e, "could not park the job"),
+        }
+        let stage = db::get_job(&self.db, id)
+            .await
+            .ok()
+            .flatten()
+            .map_or(fallback_stage, |j| j.stage);
+        self.emit(id, stage, Status::Waiting, Some(reason.to_string()));
+    }
+
     async fn run_stages(&self, job: &Job) -> Result<()> {
         let job_dir = self.work_dir.join(job_dir_name(&job.video_key));
         let mut stage = job.stage;
         let mut caption_error = job.caption_error.clone();
+        let mut folder = job.folder.clone();
         loop {
             self.emit(job.id, stage, Status::Running, None);
             let next = match stage {
@@ -391,10 +459,9 @@ where
                     self.stage_transcribe(job, &job_dir, caption_error.as_deref())
                         .await?
                 }
-                // LLM cleanup and folder sorting arrive in build step 2b.
-                Stage::Clean => Stage::File,
-                Stage::File => Stage::Write,
-                Stage::Write => return self.stage_write(job, &job_dir).await,
+                Stage::Clean => self.stage_clean(job).await?,
+                Stage::File => self.stage_file(job, &mut folder).await?,
+                Stage::Write => return self.stage_write(job, &job_dir, folder.as_deref()).await,
                 Stage::Done => return Ok(()),
             };
             if !db::set_stage(&self.db, job.id, next).await? {
@@ -472,16 +539,58 @@ where
         Ok(Stage::Clean)
     }
 
-    async fn stage_write(&self, job: &Job, job_dir: &Path) -> Result<()> {
+    /// Fluff removal and translation (PDA §4.3). Every run is stored.
+    async fn stage_clean(&self, job: &Job) -> Result<Stage> {
+        let transcript = self.transcript(job).await?;
+        let cleaned = {
+            let _slot = self.llm_slots.acquire().await.map_err(stopped)?;
+            cleanup::clean(&self.llm, &transcript, &self.cleanup).await?
+        };
+        db::insert_cleaning(&self.db, &job.video_key, &cleaned).await?;
+        Ok(Stage::File)
+    }
+
+    /// Picks the note's folder (PDA §4.6). A video that already has a note
+    /// (a re-clean) keeps it where it is, even if it was moved (FO-9).
+    async fn stage_file(&self, job: &Job, folder: &mut Option<String>) -> Result<Stage> {
+        if folder.is_some() || !db::notes_for(&self.db, &job.video_key).await?.is_empty() {
+            return Ok(Stage::Write);
+        }
         let meta = self.video(job).await?;
-        let transcript = db::load_transcript(&self.db, &job.video_key)
-            .await?
-            .ok_or_else(|| Error::State(format!("no stored transcript for {}", job.video_key)))?;
-        let path = write_note(&self.out_dir, &meta, &transcript, &(self.today)()).await?;
-        if !db::finish(&self.db, job.id, &path.display().to_string()).await? {
+        let transcript = self.transcript(job).await?;
+        let cleaned = self.cleaning(job).await?;
+        let tree = FolderTree::scan(&self.out_dir)?;
+        let title = note_title(&meta, &transcript, Some(&cleaned));
+        let placement = {
+            let _slot = self.llm_slots.acquire().await.map_err(stopped)?;
+            folders::sort(&self.llm, &tree, &title, &cleaned.text).await?
+        };
+        // Create it now, with the sorter's description (FO-6): only the
+        // path is stored on the job, and the next note may need it.
+        folders::place(&self.out_dir, &placement)?;
+        let chosen = placement.relative_path();
+        db::set_folder(&self.db, job.id, &chosen).await?;
+        *folder = Some(chosen);
+        Ok(Stage::Write)
+    }
+
+    async fn stage_write(&self, job: &Job, job_dir: &Path, folder: Option<&str>) -> Result<()> {
+        let meta = self.video(job).await?;
+        let transcript = self.transcript(job).await?;
+        let cleaned = self.cleaning(job).await?;
+        let body = render_note(&meta, &transcript, Some(&cleaned), &(self.today)());
+        let path = match self.update_existing_notes(job, &body).await? {
+            Some(path) => path,
+            None => {
+                self.write_new_note(job, &meta, &transcript, &cleaned, folder)
+                    .await?
+            }
+        };
+        let shown = path.display().to_string();
+        if !db::finish(&self.db, job.id, &shown, cleaned.review).await? {
             tracing::warn!(
                 job = job.id,
-                path = %path.display(),
+                path = %shown,
                 "job was cancelled while its note was being written; the note is kept"
             );
             return Ok(());
@@ -489,6 +598,111 @@ where
         remove_job_dir(job_dir).await;
         self.emit(job.id, Stage::Done, Status::Done, None);
         Ok(())
+    }
+
+    /// Rewrites every note for this video that is still exactly what Shruti
+    /// wrote, wherever it is now (FO-9, FO-10). Edited notes are left alone
+    /// (OUT-6). Returns the first rewritten note, if any.
+    async fn update_existing_notes(&self, job: &Job, body: &str) -> Result<Option<PathBuf>> {
+        let records = db::notes_for(&self.db, &job.video_key).await?;
+        if records.is_empty() {
+            return Ok(None);
+        }
+        let hashes: Vec<String> = records.iter().map(|r| r.content_sha256.clone()).collect();
+        let mut paths: Vec<PathBuf> = records
+            .iter()
+            .map(|r| PathBuf::from(&r.path))
+            .filter(|p| p.is_file())
+            .collect();
+        let mut moved_from = None;
+        if paths.is_empty() {
+            // Moved in Obsidian: find it by the id in its frontmatter.
+            paths = find_notes_by_id(&self.out_dir, &job.video_key)?;
+            moved_from = records.first().map(|r| r.path.clone());
+        }
+        let sha = sha256_hex(body);
+        let mut first = None;
+        for path in paths {
+            if update_note(&path, &hashes, body).await? {
+                let shown = path.display().to_string();
+                db::record_note(
+                    &self.db,
+                    &job.video_key,
+                    &shown,
+                    &sha,
+                    moved_from.as_deref(),
+                )
+                .await?;
+                first.get_or_insert(path);
+            }
+        }
+        Ok(first)
+    }
+
+    async fn write_new_note(
+        &self,
+        job: &Job,
+        meta: &VideoMeta,
+        transcript: &Transcript,
+        cleaned: &cleanup::Cleaned,
+        folder: Option<&str>,
+    ) -> Result<PathBuf> {
+        let dir = match folder {
+            Some(f) => {
+                let placement = folders::from_relative_path(&FolderTree::scan(&self.out_dir)?, f)?;
+                folders::place(&self.out_dir, &placement)?
+            }
+            // A re-clean whose earlier note was edited: the new copy goes
+            // next to it (OUT-6), else to the inbox.
+            None => match self.existing_note_dir(job).await? {
+                Some(dir) => dir,
+                None => folders::place(&self.out_dir, &Placement::Inbox)?,
+            },
+        };
+        let path = write_note(&dir, meta, transcript, Some(cleaned), &(self.today)()).await?;
+        // Fingerprint what's actually on disk: an identical earlier note
+        // may have been reused rather than a new one written.
+        let written = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(fs_err("read", &path))?;
+        let shown = path.display().to_string();
+        db::record_note(
+            &self.db,
+            &job.video_key,
+            &shown,
+            &sha256_hex(&written),
+            None,
+        )
+        .await?;
+        Ok(path)
+    }
+
+    /// The folder of this video's current note, wherever it was moved.
+    async fn existing_note_dir(&self, job: &Job) -> Result<Option<PathBuf>> {
+        let recorded = db::notes_for(&self.db, &job.video_key)
+            .await?
+            .into_iter()
+            .map(|r| PathBuf::from(r.path))
+            .find(|p| p.is_file());
+        let path = match recorded {
+            Some(p) => Some(p),
+            None => find_notes_by_id(&self.out_dir, &job.video_key)?
+                .into_iter()
+                .next(),
+        };
+        Ok(path.and_then(|p| p.parent().map(Path::to_path_buf)))
+    }
+
+    async fn transcript(&self, job: &Job) -> Result<Transcript> {
+        db::load_transcript(&self.db, &job.video_key)
+            .await?
+            .ok_or_else(|| Error::State(format!("no stored transcript for {}", job.video_key)))
+    }
+
+    async fn cleaning(&self, job: &Job) -> Result<cleanup::Cleaned> {
+        db::latest_cleaning(&self.db, &job.video_key)
+            .await?
+            .ok_or_else(|| Error::State(format!("no cleaned text for {}", job.video_key)))
     }
 
     async fn store_transcript(

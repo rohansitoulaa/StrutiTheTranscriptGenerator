@@ -1,12 +1,14 @@
 //! Markdown notes with YAML frontmatter (PDA §5, OUT-3, OUT-4, OUT-6).
 //!
-//! Step 1 writes the raw transcript; the cleanup fields (`translated`,
-//! `cleaned_by`, `cleanup`) arrive with the LLM stage.
+//! The body is the cleaned text when there is one, else the raw
+//! transcript (the CLI's `--once` mode). Notes are never overwritten unless
+//! their content is still exactly what Shruti wrote (a re-clean).
 
 use std::path::{Path, PathBuf};
 
 use tokio::io::AsyncWriteExt;
 
+use crate::cleanup::Cleaned;
 use crate::error::fs_err;
 use crate::metadata::{Platform, VideoMeta};
 use crate::transcript::Transcript;
@@ -19,21 +21,29 @@ const MAX_FILENAME_BYTES: usize = 200;
 const TITLE_FROM_TEXT_WORDS: usize = 8;
 
 /// The note's title. Reels have no real title ("Video by <handle>"), so they
-/// use the opening words of the transcript instead (PDA OUT-3).
-pub fn note_title(meta: &VideoMeta, transcript: &Transcript) -> String {
+/// use the opening words of the cleaned text, else the transcript (OUT-3).
+pub fn note_title(meta: &VideoMeta, transcript: &Transcript, cleaned: Option<&Cleaned>) -> String {
     let title = meta.title.trim();
     let placeholder = meta.platform == Platform::Instagram
         && (title.is_empty() || title.starts_with("Video by "));
     if !placeholder {
         return title.to_string();
     }
-    let words: Vec<String> = transcript
-        .segments
-        .iter()
-        .flat_map(|s| s.text.split_whitespace())
-        .take(TITLE_FROM_TEXT_WORDS)
-        .map(str::to_string)
-        .collect();
+    let words: Vec<String> = match cleaned.filter(|c| !c.text.trim().is_empty()) {
+        Some(c) => c
+            .text
+            .split_whitespace()
+            .take(TITLE_FROM_TEXT_WORDS)
+            .map(str::to_string)
+            .collect(),
+        None => transcript
+            .segments
+            .iter()
+            .flat_map(|s| s.text.split_whitespace())
+            .take(TITLE_FROM_TEXT_WORDS)
+            .map(str::to_string)
+            .collect(),
+    };
     if words.is_empty() {
         format!("Instagram reel {}", meta.id)
     } else {
@@ -81,7 +91,12 @@ pub fn note_filename(date: Option<&str>, title: &str) -> String {
     format!("{name}.md")
 }
 
-pub fn render_note(meta: &VideoMeta, transcript: &Transcript, today: &str) -> String {
+pub fn render_note(
+    meta: &VideoMeta,
+    transcript: &Transcript,
+    cleaned: Option<&Cleaned>,
+    today: &str,
+) -> String {
     // JSON string literals are valid YAML double-quoted scalars, so
     // serde_json does the escaping for free-text fields.
     let quoted = |s: &str| serde_json::Value::String(s.to_string()).to_string();
@@ -91,7 +106,7 @@ pub fn render_note(meta: &VideoMeta, transcript: &Transcript, today: &str) -> St
         .or_else(|| meta.spoken_language());
 
     let mut fm = vec![
-        format!("title: {}", quoted(&note_title(meta, transcript))),
+        format!("title: {}", quoted(&note_title(meta, transcript, cleaned))),
         format!("url: {}", quoted(&meta.url)),
         format!("platform: {}", meta.platform.as_str()),
     ];
@@ -107,11 +122,99 @@ pub fn render_note(meta: &VideoMeta, transcript: &Transcript, today: &str) -> St
     if let Some(lang) = language {
         fm.push(format!("language: {lang}"));
     }
+    if let Some(c) = cleaned {
+        fm.push(format!("translated: {}", c.translated));
+    }
     fm.push(format!("source: {}", transcript.source.as_str()));
+    if let Some(c) = cleaned {
+        fm.push(format!("cleaned_by: {}", quoted(&c.model)));
+        fm.push(format!(
+            "cleanup: {}",
+            if c.review { "review" } else { "ok" }
+        ));
+    }
     fm.push(format!("transcribed: {today}"));
     fm.push(format!("shruti_id: {}", quoted(&meta.key())));
 
-    format!("---\n{}\n---\n\n{}\n", fm.join("\n"), transcript.text())
+    let body = match cleaned {
+        Some(c) => c.text.clone(),
+        None => transcript.text(),
+    };
+    format!("---\n{}\n---\n\n{}\n", fm.join("\n"), body)
+}
+
+/// Hex SHA-256 of a note's content: the fingerprint of what Shruti wrote.
+pub fn sha256_hex(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(content.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Rewrites a note in place if its content is still exactly one of the
+/// versions Shruti wrote (`known_hashes`). Returns `false`, touching
+/// nothing, if it's missing or was edited (OUT-6: never overwrite edits).
+pub async fn update_note(path: &Path, known_hashes: &[String], content: &str) -> Result<bool> {
+    let current = match tokio::fs::read_to_string(path).await {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(fs_err("read", path)(e)),
+    };
+    if !known_hashes.contains(&sha256_hex(&current)) {
+        return Ok(false);
+    }
+    tokio::fs::write(path, content)
+        .await
+        .map_err(fs_err("write", path))?;
+    Ok(true)
+}
+
+/// Notes under `root` whose frontmatter names this video, wherever they've
+/// been moved to (FO-9). Hidden folders (`.obsidian`) are skipped.
+pub fn find_notes_by_id(root: &Path, video_key: &str) -> Result<Vec<PathBuf>> {
+    let needle = format!(
+        "shruti_id: {}",
+        serde_json::Value::String(video_key.to_string())
+    );
+    let mut found = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(fs_err("read folder", &dir)(e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(fs_err("read folder", &dir))?;
+            let path = entry.path();
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|e| e == "md")
+                && frontmatter_contains(&path, &needle)
+            {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+fn frontmatter_contains(path: &Path, needle: &str) -> bool {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    std::io::BufReader::new(file)
+        .lines()
+        .take(40)
+        .map_while(std::result::Result::ok)
+        .any(|line| line.trim() == needle)
 }
 
 /// Writes the note into `dir` (created if missing) and returns its path.
@@ -124,14 +227,18 @@ pub async fn write_note(
     dir: &Path,
     meta: &VideoMeta,
     transcript: &Transcript,
+    cleaned: Option<&Cleaned>,
     today: &str,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(fs_err("create folder", dir))?;
-    let file_name = note_filename(meta.upload_date.as_deref(), &note_title(meta, transcript));
+    let file_name = note_filename(
+        meta.upload_date.as_deref(),
+        &note_title(meta, transcript, cleaned),
+    );
     let stem = file_name.trim_end_matches(".md");
-    let body = render_note(meta, transcript, today);
+    let body = render_note(meta, transcript, cleaned, today);
 
     for n in 1..=MAX_COPIES {
         let candidate = if n == 1 {
@@ -269,7 +376,7 @@ mod tests {
     #[test]
     fn youtube_title_is_the_video_title() {
         assert_eq!(
-            note_title(&zoo(), &transcript(&["anything"])),
+            note_title(&zoo(), &transcript(&["anything"]), None),
             "Me at the zoo"
         );
     }
@@ -281,11 +388,11 @@ mod tests {
             "designing onboarding flows for apps",
         ]);
         assert_eq!(
-            note_title(&reel(), &t),
+            note_title(&reel(), &t, None),
             "Three things nobody tells you about designing onboarding"
         );
         assert_eq!(
-            note_title(&reel(), &transcript(&[])),
+            note_title(&reel(), &transcript(&[]), None),
             "Instagram reel DPx0yXkkS5M"
         );
     }
@@ -295,6 +402,7 @@ mod tests {
         let note = render_note(
             &zoo(),
             &transcript(&["Alright, so here we are.", "That's cool."]),
+            None,
             "2026-10-11",
         );
         assert_eq!(
@@ -327,7 +435,7 @@ mod tests {
         };
         let mut t = transcript(&["x"]);
         t.language = None;
-        let note = render_note(&meta, &t, "2026-10-11");
+        let note = render_note(&meta, &t, None, "2026-10-11");
         assert!(
             note.contains(r#"title: "He said \"hi\"\nthen left""#),
             "{note}"
@@ -342,15 +450,15 @@ mod tests {
     async fn write_note_never_overwrites_a_different_note() {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("nested/Inbox");
-        let p1 = write_note(&out, &zoo(), &transcript(&["first"]), "2026-10-11")
+        let p1 = write_note(&out, &zoo(), &transcript(&["first"]), None, "2026-10-11")
             .await
             .unwrap();
         assert_eq!(p1, out.join("2005-04-24 Me at the zoo.md"));
-        let p2 = write_note(&out, &zoo(), &transcript(&["second"]), "2026-10-11")
+        let p2 = write_note(&out, &zoo(), &transcript(&["second"]), None, "2026-10-11")
             .await
             .unwrap();
         assert_eq!(p2, out.join("2005-04-24 Me at the zoo (2).md"));
-        let p3 = write_note(&out, &zoo(), &transcript(&["third"]), "2026-10-11")
+        let p3 = write_note(&out, &zoo(), &transcript(&["third"]), None, "2026-10-11")
             .await
             .unwrap();
         assert_eq!(p3, out.join("2005-04-24 Me at the zoo (3).md"));
@@ -362,10 +470,10 @@ mod tests {
     async fn rerunning_the_same_link_reuses_the_note_even_on_another_day() {
         let dir = tempfile::tempdir().unwrap();
         let t = transcript(&["same words"]);
-        let p1 = write_note(dir.path(), &zoo(), &t, "2026-10-11")
+        let p1 = write_note(dir.path(), &zoo(), &t, None, "2026-10-11")
             .await
             .unwrap();
-        let p2 = write_note(dir.path(), &zoo(), &t, "2026-10-12")
+        let p2 = write_note(dir.path(), &zoo(), &t, None, "2026-10-12")
             .await
             .unwrap();
         assert_eq!(p1, p2);
@@ -381,11 +489,11 @@ mod tests {
     async fn an_edited_note_is_not_reused_or_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let t = transcript(&["same words"]);
-        let p1 = write_note(dir.path(), &zoo(), &t, "2026-10-11")
+        let p1 = write_note(dir.path(), &zoo(), &t, None, "2026-10-11")
             .await
             .unwrap();
         std::fs::write(&p1, "my own edits").unwrap();
-        let p2 = write_note(dir.path(), &zoo(), &t, "2026-10-11")
+        let p2 = write_note(dir.path(), &zoo(), &t, None, "2026-10-11")
             .await
             .unwrap();
         assert_ne!(p1, p2);
@@ -400,7 +508,7 @@ mod tests {
                 let dir = dir.path().to_path_buf();
                 tokio::spawn(async move {
                     let words = format!("writer {i}");
-                    let path = write_note(&dir, &zoo(), &transcript(&[&words]), "2026-10-11")
+                    let path = write_note(&dir, &zoo(), &transcript(&[&words]), None, "2026-10-11")
                         .await
                         .unwrap();
                     (path, words)
@@ -428,5 +536,110 @@ mod tests {
             "{} bytes",
             name.len()
         );
+    }
+
+    fn cleaned_text(text: &str, review: bool) -> Cleaned {
+        Cleaned {
+            text: text.into(),
+            translated: true,
+            review,
+            model: "lmstudio/google/gemma-4-31b".into(),
+            raw_words: 10,
+            clean_words: 5,
+            tokens_in: 0,
+            tokens_out: 0,
+        }
+    }
+
+    #[test]
+    fn cleaned_notes_carry_the_cleanup_fields_and_body() {
+        let meta = VideoMeta {
+            language: Some("hi".into()),
+            ..zoo()
+        };
+        let mut t = transcript(&["दोस्तों नमस्ते"]);
+        t.language = Some("hi".into());
+        let note = render_note(
+            &meta,
+            &t,
+            Some(&cleaned_text("Hello friends.", true)),
+            "2026-10-11",
+        );
+        assert!(note.contains("language: hi\ntranslated: true\nsource: whisper\ncleaned_by: \"lmstudio/google/gemma-4-31b\"\ncleanup: review\ntranscribed: 2026-10-11"), "{note}");
+        assert!(note.ends_with("---\n\nHello friends.\n"));
+        assert!(
+            !note.contains("दोस्तों"),
+            "the raw transcript stays in the database"
+        );
+    }
+
+    #[test]
+    fn reel_titles_prefer_the_cleaned_english_text() {
+        let t = transcript(&["तो दोस्तों आज हम बात करेंगे"]);
+        let c = cleaned_text(
+            "Today we talk about cancel flows and dark patterns in apps",
+            false,
+        );
+        assert_eq!(
+            note_title(&reel(), &t, Some(&c)),
+            "Today we talk about cancel flows and dark"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_note_rewrites_only_unedited_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.md");
+        std::fs::write(&path, "version one").unwrap();
+        let known = vec![sha256_hex("version one")];
+        assert!(update_note(&path, &known, "version two").await.unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "version two");
+        // Now "version two" is on disk, which isn't a known hash: an edit.
+        assert!(!update_note(&path, &known, "version three").await.unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "version two");
+        assert!(
+            !update_note(&dir.path().join("gone.md"), &known, "x")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn notes_are_found_by_id_wherever_they_were_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let moved = dir.path().join("Design/UX/My name for it.md");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::write(
+            &moved,
+            "---\ntitle: \"x\"\nshruti_id: \"youtube:jNQXAC9IVRw\"\n---\n\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("other.md"),
+            "---\nshruti_id: \"youtube:other\"\n---\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join(".obsidian")).unwrap();
+        std::fs::write(
+            dir.path().join(".obsidian/cache.md"),
+            "shruti_id: \"youtube:jNQXAC9IVRw\"",
+        )
+        .unwrap();
+        assert_eq!(
+            find_notes_by_id(dir.path(), "youtube:jNQXAC9IVRw").unwrap(),
+            vec![moved]
+        );
+        assert!(
+            find_notes_by_id(&dir.path().join("missing"), "x")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn fingerprints_are_stable_hex() {
+        assert_eq!(sha256_hex("").len(), 64);
+        assert_eq!(sha256_hex("a"), sha256_hex("a"));
+        assert_ne!(sha256_hex("a"), sha256_hex("b"));
     }
 }
